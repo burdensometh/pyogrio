@@ -1,5 +1,6 @@
 """Low level functions to read and write OGR data sources."""
 
+import contextlib
 import warnings
 from io import BytesIO
 from pathlib import Path
@@ -218,6 +219,83 @@ def read(
     )
 
 
+def _windowed_batches(batches, skip_features, max_features):
+    """Yield record batches limited to a window of features.
+
+    Discards the first ``skip_features`` rows and then yields at most
+    ``max_features`` rows (unlimited if None), slicing batches that straddle
+    the window boundaries so the window can start and end in the middle of a
+    batch.  Iteration stops as soon as the window has been filled, without
+    pulling further batches from the source.
+
+    Parameters
+    ----------
+    batches : iterable of Arrow record batches
+        The source batches (each must have ``num_rows`` and ``slice``).
+    skip_features : int
+        Number of features to discard from the start of the stream.
+    max_features : int or None
+        Maximum number of features to yield; None yields all remaining
+        features.
+
+    """
+    remaining = max_features
+    if remaining is not None and remaining <= 0:
+        # nothing to yield; don't pull any batch from the source
+        return
+
+    for batch in batches:
+        num_rows = batch.num_rows
+
+        # discard leading batches (or the leading part of a batch) that fall
+        # before the start of the requested window
+        if skip_features:
+            if num_rows <= skip_features:
+                skip_features -= num_rows
+                continue
+            batch = batch.slice(skip_features)
+            num_rows = batch.num_rows
+            skip_features = 0
+
+        # truncate the batch that contains the end of the requested window
+        if remaining is not None and num_rows > remaining:
+            batch = batch.slice(0, remaining)
+            num_rows = remaining
+
+        yield batch
+
+        if remaining is not None:
+            remaining -= num_rows
+            if remaining <= 0:
+                # the window is filled: stop without pulling another batch
+                return
+
+
+def _windowed_reader(reader, skip_features, max_features):
+    """Wrap an Arrow batch reader to only return the requested window of features.
+
+    The returned object is a pyarrow RecordBatchReader (which itself implements
+    the Arrow PyCapsule Protocol and thus can be passed on to other Arrow
+    implementations).  The schema of the source reader (including geometry and
+    FID columns) is preserved.
+    """
+    import pyarrow as pa
+
+    if not isinstance(reader, pa.RecordBatchReader):
+        reader = pa.RecordBatchReader.from_stream(reader)
+
+    return pa.RecordBatchReader.from_batches(
+        reader.schema, _windowed_batches(reader, skip_features, max_features)
+    )
+
+
+@contextlib.contextmanager
+def _windowed_arrow_source(source, skip_features, max_features):
+    """Apply a skip/max window to the reader of an opened Arrow source."""
+    with source as (meta, reader):
+        yield meta, _windowed_reader(reader, skip_features, max_features)
+
+
 def read_arrow(
     path_or_buffer,
     /,
@@ -268,10 +346,6 @@ def read_arrow(
             "to read data with an alternative Arrow implementation"
         )
 
-    from pyarrow import Table
-
-    gdal_version = get_gdal_version()
-
     if skip_features < 0:
         raise ValueError("'skip_features' must be >= 0")
 
@@ -287,12 +361,6 @@ def read_arrow(
     if max_features is not None and max_features < batch_size:
         batch_size = max_features
 
-    # handle skip_features internally within open_arrow if GDAL >= 3.8.0
-    gdal_skip_features = 0
-    if gdal_version >= (3, 8, 0):
-        gdal_skip_features = skip_features
-        skip_features = 0
-
     with open_arrow(
         path_or_buffer,
         layer=layer,
@@ -300,6 +368,8 @@ def read_arrow(
         columns=columns,
         read_geometry=read_geometry,
         force_2d=force_2d,
+        skip_features=skip_features,
+        max_features=max_features,
         where=where,
         bbox=bbox,
         mask=mask,
@@ -307,42 +377,17 @@ def read_arrow(
         sql=sql,
         sql_dialect=sql_dialect,
         return_fids=return_fids,
-        skip_features=gdal_skip_features,
         batch_size=batch_size,
         use_pyarrow=True,
         datetime_as_string=datetime_as_string,
         **kwargs,
-    ) as source:
-        meta, reader = source
+    ) as (meta, reader):
+        table = reader.read_all()
 
-        if max_features is not None:
-            batches = []
-            count = 0
-            while True:
-                try:
-                    batch = reader.read_next_batch()
-                    batches.append(batch)
-
-                    count += len(batch)
-                    if count >= (skip_features + max_features):
-                        break
-
-                except StopIteration:
-                    break
-
-            # use combine_chunks to release the original memory that included
-            # too many features
-            table = (
-                Table.from_batches(batches, schema=reader.schema)
-                .slice(skip_features, max_features)
-                .combine_chunks()
-            )
-
-        elif skip_features > 0:
-            table = reader.read_all().slice(skip_features).combine_chunks()
-
-        else:
-            table = reader.read_all()
+    if max_features is not None or (skip_features and get_gdal_version() < (3, 8, 0)):
+        # batches were sliced while applying the skip/max window in python;
+        # combine chunks to release the memory of the over-read features
+        table = table.combine_chunks()
 
     return meta, table
 
@@ -424,6 +469,19 @@ def open_arrow(
     >>>     for batch in reader:
     >>>         geometries = shapely.from_wkb(batch[geom_col])
 
+    Notes
+    -----
+    ``skip_features`` and ``max_features`` are applied while reading from the
+    stream: record batches are sliced across batch boundaries so that exactly
+    the requested window of features is returned, and no further batches are
+    read from the data source once ``max_features`` features have been
+    returned.  For GDAL >= 3.8.0, ``skip_features`` is applied natively by
+    GDAL; for older versions, the skipped features are read and discarded
+    while reading.  Using either parameter requires pyarrow to be installed,
+    and with ``use_pyarrow=False`` the returned stream object is then a
+    pyarrow RecordBatchReader (which itself implements the Arrow PyCapsule
+    Protocol).
+
     Returns
     -------
     (dict, pyarrow.RecordBatchReader or ArrowStream)
@@ -445,17 +503,42 @@ def open_arrow(
         }
 
     """
+    if skip_features < 0:
+        raise ValueError("'skip_features' must be >= 0")
+
+    if max_features is not None and max_features < 0:
+        raise ValueError("'max_features' must be >= 0")
+
+    if fids is not None and (skip_features or max_features is not None):
+        raise ValueError(
+            "cannot set both 'fids' and any of 'where', 'bbox', 'mask', "
+            "'sql', 'skip_features', or 'max_features'"
+        )
+
+    if (skip_features or max_features is not None) and not HAS_PYARROW:
+        raise RuntimeError(
+            "pyarrow is required to use 'skip_features' or 'max_features' "
+            "with 'open_arrow'"
+        )
+
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
 
-    return ogr_open_arrow(
+    # skip_features is applied natively by GDAL for GDAL >= 3.8.0; for older
+    # versions, the features are skipped while reading from the stream below
+    gdal_skip_features = 0
+    if get_gdal_version() >= (3, 8, 0):
+        gdal_skip_features = skip_features
+        skip_features = 0
+
+    source = ogr_open_arrow(
         get_vsi_path_or_buffer(path_or_buffer),
         layer=layer,
         encoding=encoding,
         columns=columns,
         read_geometry=read_geometry,
         force_2d=force_2d,
-        skip_features=skip_features,
-        max_features=max_features or 0,
+        skip_features=gdal_skip_features,
+        max_features=0,
         where=where,
         bbox=bbox,
         mask=_mask_to_wkb(mask),
@@ -468,6 +551,12 @@ def open_arrow(
         use_pyarrow=use_pyarrow,
         datetime_as_string=datetime_as_string,
     )
+
+    if skip_features or max_features is not None:
+        # limit the stream to the requested window of features while reading
+        return _windowed_arrow_source(source, skip_features, max_features)
+
+    return source
 
 
 def _parse_options_names(xml):

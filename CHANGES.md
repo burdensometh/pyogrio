@@ -2,6 +2,16 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Support `skip_features` and `max_features` in `pyogrio.raw.open_arrow`.
+    The requested window of features is applied while reading from the Arrow
+    stream (slicing record batches across batch boundaries and stopping once
+    `max_features` features have been returned), and `skip_features` now also
+    works with GDAL < 3.8.0 by discarding the skipped features while reading.
+    `pyogrio.raw.read_arrow` uses the same code path and no longer reads all
+    features up front to apply `skip_features` with GDAL < 3.8.0.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

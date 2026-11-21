@@ -255,39 +255,226 @@ def test_open_arrow_columns(naturalearth_lowres, descr, columns, exp_columns):
     assert result.column_names == exp_columns_with_geom, f"Failed for {descr}"
 
 
-@pytest.mark.skipif(
-    __gdal_version__ >= (3, 8, 0),
-    reason="skip_features supported by Arrow stream API for GDAL>=3.8.0",
+@pytest.mark.parametrize("use_pyarrow", [False, True])
+@pytest.mark.parametrize("skip_features, expected", [(0, 177), (10, 167), (200, 0)])
+def test_open_arrow_skip_features(
+    naturalearth_lowres, use_pyarrow, skip_features, expected
+):
+    with open_arrow(
+        naturalearth_lowres, skip_features=skip_features, use_pyarrow=use_pyarrow
+    ) as (meta, reader):
+        result = pyarrow.table(reader)
+
+    assert len(result) == expected
+
+    # check content against full read
+    _, expected_table = read_arrow(naturalearth_lowres)
+    assert result.equals(expected_table.slice(skip_features))
+
+
+@pytest.mark.parametrize("use_pyarrow", [False, True])
+@pytest.mark.parametrize(
+    "max_features, expected", [(0, 0), (10, 10), (200, 177), (100000, 177)]
 )
-@pytest.mark.parametrize("skip_features", [10, 200])
-def test_open_arrow_skip_features_unsupported(naturalearth_lowres, skip_features):
-    """skip_features are not supported for the Arrow stream interface for
-    GDAL < 3.8.0"""
-    with pytest.raises(
-        ValueError,
-        match=re.escape(
-            "specifying 'skip_features' is not supported for Arrow for GDAL<3.8.0"
-        ),
-    ):
-        with open_arrow(naturalearth_lowres, skip_features=skip_features) as (
-            _meta,
-            _reader,
-        ):
-            pass
+def test_open_arrow_max_features(
+    naturalearth_lowres, use_pyarrow, max_features, expected
+):
+    with open_arrow(
+        naturalearth_lowres, max_features=max_features, use_pyarrow=use_pyarrow
+    ) as (meta, reader):
+        result = pyarrow.table(reader)
+
+    assert len(result) == expected
+
+    # check content against full read
+    _, expected_table = read_arrow(naturalearth_lowres)
+    assert result.equals(expected_table.slice(0, max_features))
 
 
-@pytest.mark.parametrize("max_features", [10, 200])
-def test_open_arrow_max_features_unsupported(naturalearth_lowres, max_features):
-    """max_features are not supported for the Arrow stream interface"""
-    with pytest.raises(
-        ValueError,
-        match="specifying 'max_features' is not supported for Arrow",
+def test_open_arrow_negative_skip_features(naturalearth_lowres):
+    with pytest.raises(ValueError, match="'skip_features' must be >= 0"):
+        open_arrow(naturalearth_lowres, skip_features=-1)
+
+
+def test_open_arrow_negative_max_features(naturalearth_lowres):
+    with pytest.raises(ValueError, match="'max_features' must be >= 0"):
+        open_arrow(naturalearth_lowres, max_features=-1)
+
+
+def test_open_arrow_skip_features_max_features_fids_unsupported(naturalearth_lowres):
+    with pytest.raises(ValueError, match="cannot set both 'fids' and any of"):
+        open_arrow(naturalearth_lowres, fids=[1], skip_features=5)
+
+    with pytest.raises(ValueError, match="cannot set both 'fids' and any of"):
+        open_arrow(naturalearth_lowres, fids=[1], max_features=5)
+
+
+@pytest.mark.parametrize(
+    "skip_features, max_features, expected",
+    [
+        (0, 0, 0),
+        (10, 0, 0),
+        (200, 0, 0),
+        (1, 200, 176),
+        (176, 10, 1),
+        (100, 100, 77),
+        (100, 100000, 77),
+    ],
+)
+def test_open_arrow_skip_features_max_features(
+    naturalearth_lowres, skip_features, max_features, expected
+):
+    with open_arrow(
+        naturalearth_lowres, skip_features=skip_features, max_features=max_features
+    ) as (meta, reader):
+        result = pyarrow.table(reader)
+
+    assert len(result) == expected
+
+    # check content against full read
+    _, expected_table = read_arrow(naturalearth_lowres)
+    assert result.equals(expected_table.slice(skip_features, max_features))
+
+
+@pytest.mark.parametrize(
+    "skip_features, max_features, exp_batch_sizes",
+    [
+        # window boundaries aligned with batch boundaries
+        (0, 20, [10, 10]),
+        (20, 20, [10, 10]),
+        (10, 10, [10]),
+        (177, 10, []),
+        # window boundaries in the middle of batches
+        (0, 15, [10, 5]),
+        (5, 15, [5, 10]),
+        (15, 10, [5, 5]),
+        (5, 0, []),
+        (0, 1000, [10] * 17 + [7]),
+        (170, 10, [7]),
+    ],
+)
+def test_open_arrow_windowed_batch_boundaries(
+    naturalearth_lowres, skip_features, max_features, exp_batch_sizes
+):
+    """The skip/max window is applied across batch boundaries, and reading
+    stops once the window is filled (no further batches are produced)."""
+    with open_arrow(
+        naturalearth_lowres,
+        skip_features=skip_features,
+        max_features=max_features,
+        batch_size=10,
+        use_pyarrow=True,
+    ) as (meta, reader):
+        batches = list(reader)
+        schema = reader.schema
+
+    assert [len(batch) for batch in batches] == exp_batch_sizes
+
+    # check content against full read
+    _, expected_table = read_arrow(naturalearth_lowres)
+    result = pyarrow.Table.from_batches(batches, schema=schema)
+    assert result.equals(expected_table.slice(skip_features, max_features))
+
+
+def test_open_arrow_max_features_zero(naturalearth_lowres):
+    """max_features=0 returns no batches but preserves the schema"""
+    with open_arrow(naturalearth_lowres, max_features=0, use_pyarrow=True) as (
+        meta,
+        reader,
     ):
-        with open_arrow(naturalearth_lowres, max_features=max_features) as (
-            _meta,
-            _reader,
-        ):
-            pass
+        batches = list(reader)
+        schema = reader.schema
+
+    assert batches == []
+
+    _, expected_table = read_arrow(naturalearth_lowres)
+    assert schema.equals(expected_table.schema)
+
+
+def test_open_arrow_windowed_preserves_fids(naturalearth_lowres):
+    """The FID column is preserved when applying the skip/max window"""
+    with open_arrow(
+        naturalearth_lowres,
+        skip_features=5,
+        max_features=5,
+        return_fids=True,
+        use_pyarrow=True,
+    ) as (meta, reader):
+        result = reader.read_all()
+
+    _, expected_table = read_arrow(naturalearth_lowres, return_fids=True)
+    assert result.equals(expected_table.slice(5, 5))
+    assert result[meta["fid_column"]].to_pylist() == list(range(5, 10))
+
+
+def test_open_arrow_windowed_requires_pyarrow(naturalearth_lowres, monkeypatch):
+    """skip_features/max_features with open_arrow require pyarrow"""
+    monkeypatch.setattr("pyogrio.raw.HAS_PYARROW", False)
+
+    with pytest.raises(RuntimeError, match="pyarrow is required"):
+        open_arrow(naturalearth_lowres, skip_features=1)
+
+    with pytest.raises(RuntimeError, match="pyarrow is required"):
+        open_arrow(naturalearth_lowres, max_features=1)
+
+
+def test_windowed_batches():
+    """Unit tests for the generator applying the skip/max window, using a
+    source that tracks how many batches were pulled from it."""
+    from pyogrio.raw import _windowed_batches
+
+    class CountingSource:
+        def __init__(self, batches):
+            self._iter = iter(batches)
+            self.pulled = 0
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            self.pulled += 1
+            return next(self._iter)
+
+    def make_batches(n_batches=10, batch_size=10):
+        return [
+            pyarrow.record_batch({"a": range(i, i + batch_size)})
+            for i in range(0, n_batches * batch_size, batch_size)
+        ]
+
+    # max_features=0 -> no batches are pulled from the source at all
+    source = CountingSource(make_batches())
+    assert list(_windowed_batches(source, 0, 0)) == []
+    assert source.pulled == 0
+
+    # window ending exactly on a batch boundary -> no further batch is pulled
+    source = CountingSource(make_batches())
+    result = list(_windowed_batches(source, 0, 20))
+    assert [len(batch) for batch in result] == [10, 10]
+    assert source.pulled == 2
+
+    # skip landing exactly on a batch boundary -> leading batches discarded
+    # without slicing, first yielded batch is a full source batch
+    source = CountingSource(make_batches())
+    result = list(_windowed_batches(source, 20, None))
+    assert sum(len(batch) for batch in result) == 80
+    assert result[0]["a"][0].as_py() == 20
+
+    # window inside a single batch -> batch is sliced on both sides and the
+    # next batch is not pulled
+    source = CountingSource(make_batches())
+    result = list(_windowed_batches(source, 5, 5))
+    assert [len(batch) for batch in result] == [5]
+    assert result[0]["a"].to_pylist() == [5, 6, 7, 8, 9]
+    assert source.pulled == 1
+
+    # source ending before the window is filled
+    source = CountingSource(make_batches(n_batches=2))
+    result = list(_windowed_batches(source, 5, 1000))
+    assert sum(len(batch) for batch in result) == 15
+
+    # skipping past the end of the source
+    source = CountingSource(make_batches(n_batches=2))
+    assert list(_windowed_batches(source, 50, None)) == []
 
 
 @pytest.mark.skipif(
