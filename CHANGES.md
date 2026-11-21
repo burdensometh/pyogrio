@@ -2,6 +2,19 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add a `datetime_layout="utc_offset"` option to the read functions
+    (`read`, `read_arrow`, `open_arrow`, `read_dataframe`) and the write
+    functions (`write`, `write_dataframe`). It returns every datetime column
+    `<name>` as an exact UTC column together with a `<name>_offset` column
+    holding the original UTC offset, and writes such pairs back without losing
+    the local time. A missing offset (unknown time zone) is kept separate from
+    an explicit zero offset, and batched reads, daylight-saving changes and
+    `null` values keep their offsets aligned. Drivers that cannot store
+    datetime fields, and values that GDAL cannot store exactly, are rejected
+    with a clear error.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

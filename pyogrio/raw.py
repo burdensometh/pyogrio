@@ -4,6 +4,9 @@ import warnings
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
+
+from pyogrio import _datetime
 from pyogrio._compat import HAS_ARROW_WRITE_API, HAS_PYARROW
 from pyogrio._env import GDALEnv
 from pyogrio.core import detect_write_driver
@@ -36,6 +39,215 @@ DRIVERS_NO_MIXED_DIMENSIONS = {
 }
 
 
+def _add_utc_offset_columns(meta, field_data):
+    """Replace DateTime fields by a UTC column plus an offset column.
+
+    Each DateTime field is read as an ISO8601 string and paired with a
+    ``<name>_offset`` column holding the original UTC offset, so the local time
+    can be recovered without losing the exact instant.  The offset is missing
+    (``NaT``) when the file did not record a time zone and zero when it recorded
+    an explicit UTC offset; the two are deliberately kept apart.
+
+    Date (``OFTDate``) fields, which are also returned as strings when reading
+    DateTime fields as strings, are converted back to ``datetime64[D]``.
+
+    Parameters
+    ----------
+    meta : dict
+        Read metadata.
+    field_data : tuple of ndarrays
+        The field data as returned by ``ogr_read`` with ``datetime_as_string``.
+
+    Returns
+    -------
+    (dict, tuple of ndarrays)
+        The updated metadata and field data, with each DateTime field replaced by
+        a UTC datetime64 column followed by its offset column.
+    """
+    names = list(meta["fields"])
+    dtypes = list(meta["dtypes"])
+    ogr_types = list(meta["ogr_types"])
+    ogr_subtypes = list(meta["ogr_subtypes"])
+
+    new_names = []
+    new_dtypes = []
+    new_ogr_types = []
+    new_ogr_subtypes = []
+    new_field_data = []
+
+    for name, dtype, ogr_type, ogr_subtype, values in zip(
+        names, dtypes, ogr_types, ogr_subtypes, field_data, strict=True
+    ):
+        if ogr_type == "OFTDateTime":
+            utc, offsets = _datetime.parse_datetime_array(values, name)
+            new_names.append(name)
+            new_dtypes.append("datetime64[ms]")
+            new_ogr_types.append(ogr_type)
+            new_ogr_subtypes.append(ogr_subtype)
+            new_field_data.append(utc)
+
+            new_names.append(_datetime.offset_column_name(name))
+            new_dtypes.append("timedelta64[ms]")
+            new_ogr_types.append(_datetime.OFT_DATETIME_OFFSET)
+            new_ogr_subtypes.append("OFSTNone")
+            new_field_data.append(offsets)
+            continue
+
+        if ogr_type == "OFTDate":
+            # datetime_as_string also stringifies Date fields; restore the dtype
+            values = np.array(
+                [None if v is None else np.datetime64(v, "D") for v in values],
+                dtype="datetime64[D]",
+            )
+            dtype = "datetime64[D]"
+
+        new_names.append(name)
+        new_dtypes.append(dtype)
+        new_ogr_types.append(ogr_type)
+        new_ogr_subtypes.append(ogr_subtype)
+        new_field_data.append(values)
+
+    meta = dict(meta)
+    meta["fields"] = np.asarray(new_names, dtype=object)
+    meta["dtypes"] = np.asarray(new_dtypes, dtype=object)
+    meta["ogr_types"] = new_ogr_types
+    meta["ogr_subtypes"] = new_ogr_subtypes
+    meta["datetime_layout"] = _datetime.DATETIME_LAYOUT_UTC_OFFSET
+    return meta, tuple(new_field_data)
+
+
+def _datetime_field_names(meta):
+    return [
+        name
+        for name, ogr_type in zip(meta["fields"], meta["ogr_types"], strict=True)
+        if ogr_type == "OFTDateTime"
+    ]
+
+
+def _read_datetime_strings_by_fid(path_or_buffer, names, read_kwargs):
+    """Read DateTime fields as strings, keyed by FID.
+
+    The Arrow API cannot carry a per-row UTC offset for a timestamp column on
+    every GDAL version, so the DateTime fields are read a second time through the
+    string-based reader.  The result is keyed by FID, so it stays aligned with
+    the Arrow rows even when the two APIs return the features in a different
+    order (for example when ``fids`` is used).
+    """
+    read_kwargs = dict(read_kwargs)
+    # the DateTime values are re-read as strings for exactly these columns
+    read_kwargs["columns"] = names
+    _, fids, _, field_data = read(
+        path_or_buffer,
+        read_geometry=False,
+        return_fids=True,
+        datetime_as_string=True,
+        **read_kwargs,
+    )
+    by_fid = {}
+    for position, fid in enumerate(fids):
+        by_fid[int(fid)] = {
+            name: values[position]
+            for name, values in zip(names, field_data, strict=True)
+        }
+    return by_fid
+
+
+def _align_by_fid(meta, table, by_fid):
+    """Return a list of the rows of ``by_fid`` in the row order of ``table``."""
+    fid_column = meta.get("fid_column") or "OGC_FID"
+    if fid_column not in table.column_names:
+        raise RuntimeError(
+            "the FID column is missing from the Arrow data, so the DateTime "
+            "offsets cannot be aligned; use the non-Arrow API instead"
+        )
+    fids = table.column(fid_column).to_pylist()
+    try:
+        return [by_fid[int(fid)] for fid in fids]
+    except KeyError:
+        raise RuntimeError(
+            "could not align the Arrow rows with the DateTime offsets read "
+            "through the non-Arrow API (the FID values differ between the two "
+            "reads); use the non-Arrow API instead"
+        ) from None
+
+
+def _convert_table_datetime_layout(meta, table, by_fid):
+    """Replace DateTime columns of an Arrow table with UTC + offset columns."""
+    import pyarrow as pa
+
+    aligned = _align_by_fid(meta, table, by_fid)
+
+    replacements = {}
+    for name in _datetime_field_names(meta):
+        values = [row[name] for row in aligned]
+        utc, offsets = _datetime.parse_datetime_array(values, name)
+        offset_name = _datetime.offset_column_name(name)
+        replacements[name] = [
+            (name, pa.array(utc).cast(pa.timestamp("ms", tz="UTC"))),
+            (offset_name, pa.array(offsets)),
+        ]
+
+    output = []
+    for name in table.column_names:
+        entries = replacements.get(name)
+        if entries is not None:
+            output.extend(entries)
+        else:
+            output.append((name, table.column(name)))
+
+    return pa.table(dict(output))
+
+
+def _new_meta_for_datetime_layout(meta):
+    """Return metadata describing the UTC + offset columns."""
+    names = list(meta["fields"])
+    dtypes = list(meta["dtypes"])
+    ogr_types = list(meta["ogr_types"])
+    ogr_subtypes = list(meta["ogr_subtypes"])
+
+    new_names = []
+    new_dtypes = []
+    new_ogr_types = []
+    new_ogr_subtypes = []
+    for name, dtype, ogr_type, ogr_subtype in zip(
+        names, dtypes, ogr_types, ogr_subtypes, strict=True
+    ):
+        new_names.append(name)
+        new_dtypes.append(dtype)
+        new_ogr_types.append(ogr_type)
+        new_ogr_subtypes.append(ogr_subtype)
+        if ogr_type == "OFTDateTime":
+            new_dtypes[-1] = "datetime64[ms]"
+            new_names.append(_datetime.offset_column_name(name))
+            new_dtypes.append("timedelta64[ms]")
+            new_ogr_types.append(_datetime.OFT_DATETIME_OFFSET)
+            new_ogr_subtypes.append("OFSTNone")
+
+    new_meta = dict(meta)
+    new_meta["fields"] = np.asarray(new_names, dtype=object)
+    new_meta["dtypes"] = np.asarray(new_dtypes, dtype=object)
+    new_meta["ogr_types"] = new_ogr_types
+    new_meta["ogr_subtypes"] = new_ogr_subtypes
+    new_meta["datetime_layout"] = _datetime.DATETIME_LAYOUT_UTC_OFFSET
+    return new_meta
+
+
+def _apply_datetime_layout_to_arrow(path_or_buffer, meta, table, read_kwargs):
+    """Apply the dual-column contract to an Arrow table.
+
+    The DateTime values are re-read as strings through the (non-Arrow) reader and
+    matched to the Arrow rows by FID, so the offsets stay attached to the right
+    feature regardless of the order in which the two APIs return them.
+    """
+    names = _datetime_field_names(meta)
+    if not names:
+        return _new_meta_for_datetime_layout(meta), table
+
+    by_fid = _read_datetime_strings_by_fid(path_or_buffer, names, read_kwargs)
+    table = _convert_table_datetime_layout(meta, table, by_fid)
+    return _new_meta_for_datetime_layout(meta), table
+
+
 def read(
     path_or_buffer,
     /,
@@ -54,6 +266,7 @@ def read(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    datetime_layout=None,
     **kwargs,
 ):
     """Read OGR data source into numpy arrays.
@@ -153,6 +366,15 @@ def read(
         If True, will return datetime dtypes as detected by GDAL as a string
         array (which can be used to extract time zone info), instead of
         a datetime64 array.
+    datetime_layout : str, optional (default: None)
+        If set to ``"utc_offset"``, DateTime fields are returned as two arrays:
+        the field itself holds the exact instant in UTC (``datetime64[ms]``), and
+        a companion ``<name>_offset`` field holds the original UTC offset as
+        ``timedelta64[ms]``. A missing offset (``NaT``) means the file did not
+        record a time zone, while zero means it recorded an explicit UTC offset.
+        Cannot be combined with ``datetime_as_string``. The metadata is updated
+        to describe both fields, and the offset fields have OGR type
+        ``"OFTDateTimeOffset"``.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR.  Invalid
@@ -196,8 +418,9 @@ def read(
 
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
+    _datetime.validate_layout(datetime_layout, datetime_as_string)
 
-    return ogr_read(
+    meta, fids, geometry, field_data = ogr_read(
         get_vsi_path_or_buffer(path_or_buffer),
         layer=layer,
         encoding=encoding,
@@ -214,8 +437,13 @@ def read(
         sql_dialect=sql_dialect,
         return_fids=return_fids,
         dataset_kwargs=dataset_kwargs,
-        datetime_as_string=datetime_as_string,
+        datetime_as_string=datetime_as_string or _datetime.is_enabled(datetime_layout),
     )
+
+    if _datetime.is_enabled(datetime_layout):
+        meta, field_data = _add_utc_offset_columns(meta, field_data)
+
+    return meta, fids, geometry, field_data
 
 
 def read_arrow(
@@ -236,11 +464,16 @@ def read_arrow(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    datetime_layout=None,
     **kwargs,
 ):
     """Read OGR data source into a pyarrow Table.
 
     See docstring of `read` for parameters.
+
+    When ``datetime_layout="utc_offset"`` is used, DateTime columns are returned
+    as a ``timestamp[ms, tz=UTC]`` column plus a ``duration[ms]``
+    ``<name>_offset`` column (see `read`).
 
     Returns
     -------
@@ -268,6 +501,8 @@ def read_arrow(
             "to read data with an alternative Arrow implementation"
         )
 
+    _datetime.validate_layout(datetime_layout, datetime_as_string)
+
     from pyarrow import Table
 
     gdal_version = get_gdal_version()
@@ -277,6 +512,10 @@ def read_arrow(
 
     if max_features is not None and max_features < 0:
         raise ValueError("'max_features' must be >= 0")
+
+    # remember the requested range before it is rearranged below
+    requested_skip_features = skip_features
+    requested_max_features = max_features
 
     # limit batch size to max_features if set
     if "batch_size" in kwargs:
@@ -293,6 +532,12 @@ def read_arrow(
         gdal_skip_features = skip_features
         skip_features = 0
 
+    # The dual-column contract aligns the offsets read through the non-Arrow API
+    # with the Arrow rows by FID, so the FID column is needed internally.
+    dual_layout = _datetime.is_enabled(datetime_layout)
+    internal_fids = return_fids or dual_layout
+    user_wants_fids = return_fids
+
     with open_arrow(
         path_or_buffer,
         layer=layer,
@@ -306,7 +551,7 @@ def read_arrow(
         fids=fids,
         sql=sql,
         sql_dialect=sql_dialect,
-        return_fids=return_fids,
+        return_fids=internal_fids,
         skip_features=gdal_skip_features,
         batch_size=batch_size,
         use_pyarrow=True,
@@ -344,6 +589,33 @@ def read_arrow(
         else:
             table = reader.read_all()
 
+    if dual_layout:
+        meta, table = _apply_datetime_layout_to_arrow(
+            path_or_buffer,
+            meta,
+            table,
+            read_kwargs={
+                "layer": layer,
+                "encoding": encoding,
+                "columns": columns,
+                "skip_features": requested_skip_features,
+                "max_features": requested_max_features,
+                "where": where,
+                "bbox": bbox,
+                "mask": mask,
+                "fids": fids,
+                "sql": sql,
+                "sql_dialect": sql_dialect,
+                **kwargs,
+            },
+        )
+
+        if not user_wants_fids:
+            # the FID column was only read internally, so drop it again
+            fid_column = meta.get("fid_column") or "OGC_FID"
+            if fid_column in table.column_names:
+                table = table.drop([fid_column])
+
     return meta, table
 
 
@@ -367,12 +639,18 @@ def open_arrow(
     batch_size=65_536,
     use_pyarrow=False,
     datetime_as_string=False,
+    datetime_layout=None,
     **kwargs,
 ):
     """Open OGR data source as a stream of Arrow record batches.
 
     See docstring of `read` for parameters.
 
+    When ``datetime_layout="utc_offset"`` is used, the stream has each DateTime
+    column replaced by a ``timestamp[ms, tz=UTC]`` column followed by a
+    ``duration[ms]`` ``<name>_offset`` column. This requires ``pyarrow``, and each
+    batch is converted independently, so an offset can never move to another row
+    when the data is split into batches.
     The returned object is reading from a stream provided by OGR and must not be
     accessed after the OGR dataset has been closed, i.e. after the context manager has
     been closed.
@@ -446,33 +724,138 @@ def open_arrow(
 
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
+    _datetime.validate_layout(datetime_layout, datetime_as_string)
 
-    return ogr_open_arrow(
-        get_vsi_path_or_buffer(path_or_buffer),
-        layer=layer,
-        encoding=encoding,
-        columns=columns,
-        read_geometry=read_geometry,
-        force_2d=force_2d,
-        skip_features=skip_features,
-        max_features=max_features or 0,
-        where=where,
-        bbox=bbox,
-        mask=_mask_to_wkb(mask),
-        fids=fids,
-        sql=sql,
-        sql_dialect=sql_dialect,
-        return_fids=return_fids,
-        dataset_kwargs=dataset_kwargs,
-        batch_size=batch_size,
+    if not _datetime.is_enabled(datetime_layout):
+        return ogr_open_arrow(
+            get_vsi_path_or_buffer(path_or_buffer),
+            layer=layer,
+            encoding=encoding,
+            columns=columns,
+            read_geometry=read_geometry,
+            force_2d=force_2d,
+            skip_features=skip_features,
+            max_features=max_features or 0,
+            where=where,
+            bbox=bbox,
+            mask=_mask_to_wkb(mask),
+            fids=fids,
+            sql=sql,
+            sql_dialect=sql_dialect,
+            return_fids=return_fids,
+            dataset_kwargs=dataset_kwargs,
+            batch_size=batch_size,
+            use_pyarrow=use_pyarrow,
+            datetime_as_string=datetime_as_string,
+        )
+
+    # The dual-column contract needs the ISO8601 representation of each
+    # date-time, which the Arrow stream only provides from GDAL 3.11 on (and
+    # then offsets are attached per row while each batch is converted on its
+    # own, so they cannot shift).
+    if get_gdal_version() < (3, 11, 0):
+        raise NotImplementedError(
+            "'datetime_layout=\"utc_offset\"' through open_arrow requires GDAL "
+            ">= 3.11; use read_arrow() or the non-Arrow API instead"
+        )
+
+    return _DatetimeLayoutContext(
+        ogr_open_arrow(
+            get_vsi_path_or_buffer(path_or_buffer),
+            layer=layer,
+            encoding=encoding,
+            columns=columns,
+            read_geometry=read_geometry,
+            force_2d=force_2d,
+            skip_features=skip_features,
+            max_features=max_features or 0,
+            where=where,
+            bbox=bbox,
+            mask=_mask_to_wkb(mask),
+            fids=fids,
+            sql=sql,
+            sql_dialect=sql_dialect,
+            return_fids=return_fids,
+            dataset_kwargs=dataset_kwargs,
+            batch_size=batch_size,
+            use_pyarrow=use_pyarrow,
+            datetime_as_string=True,
+        ),
         use_pyarrow=use_pyarrow,
-        datetime_as_string=datetime_as_string,
     )
 
 
+class _DatetimeLayoutContext:
+    """Context manager returned by ``open_arrow(datetime_layout="utc_offset")``."""
+
+    def __init__(self, source_context, use_pyarrow):
+        self._source_context = source_context
+        self._use_pyarrow = use_pyarrow
+        self._source = None
+
+    def __enter__(self):
+        self._source = self._source_context.__enter__()
+        meta, reader = self._source
+        new_meta = _new_meta_for_datetime_layout(meta)
+        converted = _DatetimeLayoutReader(reader, meta)
+        if self._use_pyarrow:
+            import pyarrow as pa
+
+            converted = pa.RecordBatchReader.from_stream(converted.__arrow_c_stream__())
+        return new_meta, converted
+
+    def __exit__(self, *exc_info):
+        return self._source_context.__exit__(*exc_info)
+
+
+class _DatetimeLayoutReader:
+    """Arrow stream that converts each batch individually and then yields it.
+
+    Converting batch by batch keeps every offset on its own row no matter how the
+    data is split.
+    """
+
+    def __init__(self, reader, meta):
+        self._reader = reader
+        self._meta = meta
+        self._datetime_names = _datetime_field_names(meta)
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        table = self._build_table()
+        return table.__arrow_c_stream__(requested_schema)
+
+    def _build_table(self):
+        import pyarrow as pa
+
+        batches = (self._convert(batch) for batch in self._reader)
+        return pa.Table.from_batches(batches)
+
+    def _convert(self, batch):
+        import pyarrow as pa
+
+        replacements = {}
+        for name in self._datetime_names:
+            values = batch.column(name).to_pylist()
+            utc, offsets = _datetime.parse_datetime_array(values, name)
+            replacements[name] = [
+                (name, pa.array(utc).cast(pa.timestamp("ms", tz="UTC"))),
+                (_datetime.offset_column_name(name), pa.array(offsets)),
+            ]
+
+        output = []
+        for name in batch.schema.names:
+            entries = replacements.get(name)
+            if entries is not None:
+                output.extend(entries)
+            else:
+                output.append((name, batch.column(name)))
+        return pa.RecordBatch.from_arrays(
+            [array for _, array in output], names=[name for name, _ in output]
+        )
+
+
 def _parse_options_names(xml):
-    """Convert metadata xml to list of names."""
-    # Based on Fiona's meta.py
+    """Convert metadata xml to list of names."""  # Based on Fiona's meta.py
     # (https://github.com/Toblerity/Fiona/blob/91c13ad8424641557a4e5f038f255f9b657b1bc5/fiona/meta.py)
     import xml.etree.ElementTree as ET
 
@@ -592,6 +975,48 @@ def _get_write_path_driver(path, driver, append=False):
     return path, driver
 
 
+def _prepare_datetime_layout_write(
+    driver, fields, field_data, field_mask, gdal_tz_offsets, datetime_layout
+):
+    """Turn UTC + offset column pairs back into GDAL date-time fields.
+
+    Returns the remaining fields, field data and field masks, together with the
+    computed ``gdal_tz_offsets``.  The ``<name>_offset`` columns are removed.
+    """
+    if not _datetime.is_enabled(datetime_layout):
+        return field_data, fields, field_mask, gdal_tz_offsets
+
+    offset_columns = _datetime.find_offset_columns(
+        fields,
+        dtypes_by_name={
+            name: getattr(values, "dtype", None)
+            for name, values in zip(fields, field_data, strict=True)
+        },
+    )
+    if not offset_columns:
+        return field_data, fields, field_mask, gdal_tz_offsets
+
+    _datetime.validate_driver_supports_datetime_offset(driver)
+
+    positions = {name: index for index, name in enumerate(fields)}
+    drop = {positions[offset] for offset in offset_columns.values()}
+    combined = dict(gdal_tz_offsets or {})
+
+    for name, offset_name in offset_columns.items():
+        utc_values = field_data[positions[name]]
+        offset_values = field_data[positions[offset_name]]
+        wall, flags = _datetime.prepare_write(utc_values, offset_values, name)
+        field_data[positions[name]] = wall
+        combined[name] = flags
+
+    def keep(values):
+        if values is None:
+            return None
+        return [value for index, value in enumerate(values) if index not in drop]
+
+    return keep(field_data), keep(fields), keep(field_mask), combined
+
+
 def write(
     path,
     geometry,
@@ -613,6 +1038,7 @@ def write(
     dataset_options=None,
     layer_options=None,
     gdal_tz_offsets=None,
+    datetime_layout=None,
     **kwargs,
 ):
     """Write geometry and field data to an OGR file format.
@@ -694,6 +1120,16 @@ def write(
         a key-value dictionary.
     gdal_tz_offsets : dict, optional (default: None)
         Used to handle GDAL time zone offsets for each field contained in dict.
+    datetime_layout : str, optional (default: None)
+        If set to ``"utc_offset"``, each datetime64 field that has a
+        ``<name>_offset`` timedelta64 field next to it is written back as one
+        date-time field: the UTC value and its offset are combined into the local
+        wall clock value that GDAL stores, with the offset written alongside it.
+        The offset field itself is not written, and its name is removed from
+        ``fields``. ``NaT`` offsets are written as an unknown time zone. Values
+        that GDAL cannot store exactly (sub-millisecond date-times or offsets that
+        are not a whole multiple of 15 minutes, larger than +14:00 or smaller
+        than -12:00) raise ``ValueError`` instead of being rounded.
     **kwargs
         Additional driver-specific dataset creation options passed to OGR. Invalid
         options will trigger a warning.
@@ -730,6 +1166,18 @@ def write(
         driver, dataset_options, layer_options, kwargs
     )
 
+    if field_data is not None and fields is not None:
+        field_data, fields, field_mask, gdal_tz_offsets = (
+            _prepare_datetime_layout_write(
+                driver,
+                list(fields),
+                list(field_data),
+                None if field_mask is None else list(field_mask),
+                gdal_tz_offsets,
+                datetime_layout,
+            )
+        )
+
     ogr_write(
         path,
         layer=layer,
@@ -752,6 +1200,83 @@ def write(
     )
 
 
+def _arrow_combine_datetime_layout(arrow_obj, driver):
+    """Combine UTC + offset column pairs of an Arrow table for writing.
+
+    A ``timestamp`` + ``duration`` pair cannot be written as one date-time field
+    through GDAL's Arrow writer, so the pair is turned into an ISO8601 string
+    column (with a per-row offset) and marked as a DateTime field via column
+    metadata, which GDAL understands.
+    """
+    if not HAS_PYARROW:
+        raise RuntimeError("pyarrow is required to write with 'datetime_layout'")
+
+    import pyarrow as pa
+
+    capsule = arrow_obj.__arrow_c_stream__()
+    table = pa.RecordBatchReader._import_from_c_capsule(capsule).read_all()
+    names = table.column_names
+    # only treat ``<name>_offset`` as a companion when it holds a duration and
+    # ``<name>`` holds a timestamp, so an unrelated column of the same name is
+    # left alone
+    offset_names = {
+        name
+        for name in names
+        if _datetime.is_offset_column_name(name)
+        and pa.types.is_duration(table.schema.field(name).type)
+        and _datetime.base_column_name(name) in names
+        and pa.types.is_timestamp(
+            table.schema.field(_datetime.base_column_name(name)).type
+        )
+    }
+    if not offset_names:
+        return table
+
+    _datetime.validate_driver_supports_datetime_offset(driver)
+
+    datetime_columns = []
+    replacements = {}
+    for offset_name in offset_names:
+        name = _datetime.base_column_name(offset_name)
+        if name not in names:
+            continue
+        timestamp_field = table.schema.field(name)
+        column = table.column(name)
+        if timestamp_field.type.tz not in (None, "UTC"):
+            # bring any other time zone to UTC first; the exact instant is
+            # unchanged and the original offset is in the companion column
+            column = column.cast(pa.timestamp("ms", tz="UTC"))
+        utc_values = column.cast(pa.timestamp("ms")).to_numpy(zero_copy_only=False)
+        offsets = table.column(offset_name).to_numpy(zero_copy_only=False)
+        _datetime.utc_to_wall_and_flags(utc_values, offsets, name)
+        strings = _datetime.format_utc_offset_strings(utc_values, offsets)
+        replacements[name] = (name, pa.array(strings, type=pa.string()))
+        datetime_columns.append(name)
+
+    if not replacements:
+        return table
+
+    output = []
+    for name in names:
+        if name in offset_names:
+            continue
+        replacement = replacements.get(name)
+        output.append(
+            replacement if replacement is not None else (name, table.column(name))
+        )
+
+    result = pa.table(dict(output))
+    fields = []
+    for field in result.schema:
+        if field.name in datetime_columns:
+            metadata = dict(field.metadata or {})
+            metadata[b"GDAL:OGR:type"] = b"DateTime"
+            fields.append(field.with_metadata(metadata))
+        else:
+            fields.append(field)
+    return result.cast(pa.schema(fields, metadata=result.schema.metadata))
+
+
 def write_arrow(
     arrow_obj,
     path,
@@ -767,6 +1292,7 @@ def write_arrow(
     metadata=None,
     dataset_options=None,
     layer_options=None,
+    datetime_layout=None,
     **kwargs,
 ):
     """Write an Arrow-compatible data source to an OGR file format.
@@ -832,6 +1358,13 @@ def write_arrow(
     layer_options : dict, optional
         Layer creation options (format specific) passed to OGR. Specify as
         a key-value dictionary.
+    datetime_layout : str, optional (default: None)
+        If set to ``"utc_offset"``, each ``timestamp`` column ``<name>`` that has
+        a ``duration`` column ``<name>_offset`` next to it is written back as one
+        date-time field: the local wall clock time is reconstructed from the UTC
+        value and the offset, and the offset column is dropped. ``NaT`` offsets
+        are written as an unknown time zone. Drivers that cannot store date-time
+        fields are rejected, as are values that GDAL cannot store exactly.
     **kwargs
         Additional driver-specific dataset or layer creation options passed
         to OGR. pyogrio will attempt to automatically pass those keywords
@@ -852,7 +1385,12 @@ def write_arrow(
             "'__arrow_c_stream__' method)."
         )
 
+    _datetime.validate_layout(datetime_layout)
+
     path, driver = _get_write_path_driver(path, driver, append=append)
+
+    if _datetime.is_enabled(datetime_layout):
+        arrow_obj = _arrow_combine_datetime_layout(arrow_obj, driver)
 
     if "promote_to_multi" in kwargs:
         raise ValueError(

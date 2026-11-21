@@ -526,8 +526,54 @@ def geojson_bytes(tmp_path):
 
 
 @pytest.fixture(scope="function")
+def datetime_offset_file(tmp_path):
+    """GeoJSON with a datetime column that mixes offsets, DST fall-back and null.
+
+    The two ``01:30`` readings are the same wall clock time on the night a North
+    American time zone falls back from -04:00 to -05:00, so they are distinct
+    instants.  The other rows cover an explicit zero offset (``Z``), a datetime
+    without any offset (unknown time zone) and a null.
+    """
+    datetime_offset_geojson = """{
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "properties": { "observed": "2024-11-03T01:30:00-04:00" },
+                "geometry": { "type": "Point", "coordinates": [0, 0] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "observed": "2024-11-03T01:30:00-05:00" },
+                "geometry": { "type": "Point", "coordinates": [1, 0] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "observed": "2024-01-01T00:00:00Z" },
+                "geometry": { "type": "Point", "coordinates": [2, 0] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "observed": "2024-01-01T00:00:00" },
+                "geometry": { "type": "Point", "coordinates": [3, 0] }
+            },
+            {
+                "type": "Feature",
+                "properties": { "observed": null },
+                "geometry": { "type": "Point", "coordinates": [4, 0] }
+            }
+        ]
+    }"""
+
+    filename = tmp_path / "test_datetime_offset.geojson"
+    with open(filename, "w") as f:
+        f.write(datetime_offset_geojson)
+
+    return filename
+
+
+@pytest.fixture(scope="function")
 def geojson_datetime_long_ago(tmp_path):
-    # create GeoJSON file with datetimes from long ago
     datetime_tz_geojson = """{
         "type": "FeatureCollection",
         "features": [

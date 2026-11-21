@@ -7,6 +7,7 @@ from datetime import datetime
 
 import numpy as np
 
+from pyogrio import _datetime
 from pyogrio._compat import (
     HAS_GEOPANDAS,
     HAS_PYARROW,
@@ -39,6 +40,20 @@ def _stringify_path(path):
 
     # pass-though other objects
     return path
+
+
+def _localize_to_utc(ser):
+    """Return a pandas ``datetime64[ms, UTC]`` series from a UTC datetime series."""
+    import pandas as pd
+
+    if isinstance(ser.dtype, pd.DatetimeTZDtype):
+        return ser
+    result = pd.to_datetime(ser).dt.tz_localize("UTC")
+    if PANDAS_GE_20:
+        result = result.dt.as_unit("ms")
+    else:
+        result = result.dt.round(freq="ms")
+    return result
 
 
 def _try_parse_datetime(ser, datetime_as_string: bool, mixed_offsets_as_utc: bool):
@@ -157,6 +172,7 @@ def read_dataframe(
     arrow_to_pandas_kwargs=None,
     datetime_as_string=False,
     mixed_offsets_as_utc=True,
+    datetime_layout=None,
     **kwargs,
 ):
     """Read from an OGR data source to a GeoPandas GeoDataFrame or Pandas DataFrame.
@@ -313,6 +329,19 @@ def read_dataframe(
           option, but you lose the functionality of a datetime64 column.
 
         If ``datetime_as_string`` is True, this option is ignored.
+    datetime_layout : str, optional (default: None)
+        If set to ``"utc_offset"``, the dual-column datetime contract is used
+        instead of the ``mixed_offsets_as_utc`` logic: every datetime column
+        ``<name>`` is returned as a UTC ``datetime64[ms, UTC]`` column holding the
+        exact instant, together with a ``<name>_offset`` column holding the
+        original UTC offset as ``timedelta64[ms]``. A missing offset (``NaT``)
+        means the file did not record a time zone, while a zero offset means it
+        recorded an explicit UTC offset; the two are kept apart. Using this
+        option makes the local time and the time zone recoverable even for
+        column with mixed offsets or daylight-saving changes. Cannot be
+        combined with ``datetime_as_string``, and ``mixed_offsets_as_utc`` is
+        ignored. Pass the same option to ``write_dataframe`` to write such
+        columns back without losing the original offset.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR. Invalid
@@ -379,6 +408,13 @@ def read_dataframe(
     # is used, needed because datetime columns don't support mixed time zone
     # offsets + e.g. for .fgb files time zone info isn't handled correctly even
     # for unique time zone offsets if datetimes are not read as string.
+    # With the dual-column contract the reader already returns UTC datetimes and
+    # their offsets, so it does its own parsing instead.
+    dual_layout = _datetime.is_enabled(datetime_layout)
+    read_kwargs = {} if dual_layout else {"datetime_as_string": True}
+    if dual_layout:
+        read_kwargs["datetime_layout"] = datetime_layout
+
     result = read_func(
         path_or_buffer,
         layer=layer,
@@ -395,7 +431,7 @@ def read_dataframe(
         sql=sql,
         sql_dialect=sql_dialect,
         return_fids=fid_as_index,
-        datetime_as_string=True,
+        **read_kwargs,
         **kwargs,
     )
 
@@ -445,6 +481,8 @@ def read_dataframe(
                 and dtype.startswith("datetime")
                 # With arrow, date columns are returned as datetime.date objects
                 and dtype != "datetime64[D]"
+                # The dual-column contract already returned parsed datetimes
+                and not dual_layout
             ):
                 df[column] = _try_parse_datetime(
                     df[column], datetime_as_string, mixed_offsets_as_utc
@@ -502,9 +540,21 @@ def read_dataframe(
     else:
         index = None
     df = pd.DataFrame(data, columns=columns, index=index)
-    for dtype, c in zip(meta["dtypes"], meta["fields"], strict=True):
-        if dtype.startswith("datetime"):
-            df[c] = _try_parse_datetime(df[c], datetime_as_string, mixed_offsets_as_utc)
+    if dual_layout:
+        # The reader returns UTC datetimes; make them explicitly UTC so the dtype
+        # matches the Arrow path (``datetime64[ms, UTC]``). Date-only fields are
+        # left untouched.
+        for dtype, c in zip(meta["dtypes"], meta["fields"], strict=True):
+            if dtype is not None and dtype.startswith("datetime"):
+                if dtype == "datetime64[D]":
+                    continue
+                df[c] = _localize_to_utc(df[c])
+    else:
+        for dtype, c in zip(meta["dtypes"], meta["fields"], strict=True):
+            if dtype.startswith("datetime"):
+                df[c] = _try_parse_datetime(
+                    df[c], datetime_as_string, mixed_offsets_as_utc
+                )
     for ogr_subtype, c in zip(meta["ogr_subtypes"], meta["fields"], strict=True):
         if ogr_subtype == "OFSTJSON":
             dtype = pd.api.types.infer_dtype(df[c])
@@ -541,6 +591,7 @@ def write_dataframe(
     metadata=None,
     dataset_options=None,
     layer_options=None,
+    datetime_layout=None,
     **kwargs,
 ):
     """Write GeoPandas GeoDataFrame to an OGR file format.
@@ -646,6 +697,14 @@ def write_dataframe(
     Object dtype columns containing `datetime` or `pandas.Timestamp` objects will
     also be written as datetime fields, preserving time zone information where possible.
 
+    With ``datetime_layout="utc_offset"``, a UTC datetime column ``<name>``
+    together with a ``<name>_offset`` timedelta column (as returned by
+    ``read_dataframe(..., datetime_layout="utc_offset")``) is written back as a
+    single date-time field: the local wall clock time is reconstructed from the
+    UTC instant and the offset, so the roundtrip is lossless. The offset column
+    is not written. Drivers that cannot store date-time fields are rejected,
+    and values whose precision GDAL cannot store raise ``ValueError``.
+
     """
     # TODO: add examples to the docstring (e.g. OGR kwargs)
 
@@ -661,6 +720,9 @@ def write_dataframe(
     if use_arrow is None:
         use_arrow = bool(int(os.environ.get("PYOGRIO_USE_ARROW", "0")))
     path, driver = _get_write_path_driver(path, driver, append=append)
+
+    _datetime.validate_layout(datetime_layout)
+    dual_layout = _datetime.is_enabled(datetime_layout)
 
     geometry_columns = df.columns[df.dtypes == "geometry"]
     if len(geometry_columns) > 1:
@@ -757,6 +819,24 @@ def write_dataframe(
 
         df = df.copy(deep=False)
 
+        # With the dual-column contract, combine each UTC datetime column and its
+        # ``_offset`` companion into one ISO8601 string column (which GDAL reads
+        # with the per-row offset), drop the offset column, and mark the string
+        # column as DateTime.
+        offset_columns = {}
+        if dual_layout:
+            _datetime.validate_driver_supports_datetime_offset(driver)
+            offset_columns = _datetime.find_offset_columns(
+                [c for c in df.columns if c != geometry_column],
+                dtypes_by_name=dict(df.dtypes),
+            )
+            if offset_columns:
+                df, dual_datetime_columns = _prepare_dual_datetime_columns_for_arrow(
+                    df, offset_columns
+                )
+            else:
+                dual_datetime_columns = []
+
         if geometry_column is not None:
             # Convert to multi type
             if promote_to_multi:
@@ -792,9 +872,12 @@ def write_dataframe(
         # can contain datetime values with different offsets to strings.
         # Also pass a list of these columns on to GDAL so it can still treat them as
         # datetime columns when writing the dataset.
-        datetime_cols = []
+        datetime_cols = list(dual_datetime_columns)
         for name, dtype in df.dtypes.items():
             if geometry_column is not None and name == geometry_column:
+                continue
+            if name in dual_datetime_columns:
+                # already a string column with per-row offsets
                 continue
             if dtype == "object":
                 inferred_dtype = pd.api.types.infer_dtype(df[name])
@@ -899,11 +982,24 @@ def write_dataframe(
     field_mask = []
     # dict[str, np.array(int)] special case for dt-tz fields
     gdal_tz_offsets = {}
+    # With the dual-column contract, the offset is already available as a
+    # companion column, so a timezone-aware UTC column must not also contribute
+    # a zero offset for itself.
+    offset_columns = (
+        _datetime.find_offset_columns(fields, dtypes_by_name=dict(df.dtypes))
+        if dual_layout
+        else {}
+    )
     for name in fields:
         col = df[name]
         values = None
 
-        if isinstance(col.dtype, pd.DatetimeTZDtype):
+        if name in offset_columns:
+            # the datetime column: `values` are the exact UTC instants; the
+            # companion offset column carries the original offset
+            values = _datetime_series_to_numpy(col)
+
+        elif isinstance(col.dtype, pd.DatetimeTZDtype):
             # Deal with datetimes with time zones by passing down time zone separately
             # pass down naive datetime
             naive = col.dt.tz_localize(None)
@@ -965,8 +1061,43 @@ def write_dataframe(
         dataset_options=dataset_options,
         layer_options=layer_options,
         gdal_tz_offsets=gdal_tz_offsets,
+        datetime_layout=datetime_layout,
         **kwargs,
     )
+
+
+def _prepare_dual_datetime_columns_for_arrow(df, offset_columns):
+    """Combine UTC + offset column pairs into ISO8601 strings for the Arrow writer.
+
+    Returns the modified DataFrame and the names of the columns that must be
+    written as DateTime fields.
+    """
+    import pandas as pd
+
+    df = df.copy(deep=False)
+    datetime_columns = []
+    for name, offset_name in offset_columns.items():
+        utc_values = _datetime_series_to_numpy(df[name])
+        offsets = df[offset_name].to_numpy(dtype="timedelta64[ms]")
+        # validate exactly like the non-Arrow path before rendering strings
+        _datetime.utc_to_wall_and_flags(utc_values, offsets, name)
+        strings = _datetime.format_utc_offset_strings(utc_values, offsets)
+        df[name] = pd.array(strings, dtype="string")
+        df = df.drop(columns=[offset_name])
+        datetime_columns.append(name)
+    return df, datetime_columns
+
+
+def _datetime_series_to_numpy(ser):
+    """Return a ``datetime64[ms]`` numpy array from a datetime series."""
+    import pandas as pd
+
+    if isinstance(ser.dtype, pd.DatetimeTZDtype):
+        # tz-aware columns may have any tz; the values are already UTC instants
+        if str(ser.dtype.tz) != "UTC":
+            ser = ser.dt.tz_convert("UTC")
+        ser = ser.dt.tz_localize(None)
+    return ser.to_numpy(dtype="datetime64[ms]")
 
 
 def _add_column_metadata(table, column_metadata: dict = {}):

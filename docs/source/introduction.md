@@ -499,6 +499,34 @@ is lost, only the offsets can be preserved. By default,
 to return a datetime64 column. If you want to preserve the original offsets,
 you can use `datetime_as_string=True` or `mixed_offsets_as_utc=False`.
 
+### Keeping both the UTC instant and the original offset
+
+Converting a column with mixed offsets to UTC loses the local time of each
+observation: two rows can end up with the same UTC value even though they were
+recorded at different local times. To avoid that, pass
+`datetime_layout="utc_offset"` to {func}`pyogrio.read_dataframe`,
+{func}`pyogrio.read_arrow` or {func}`pyogrio.raw.read`. Every datetime column
+`<name>` is then returned as two columns:
+
+- `<name>`: the exact instant in UTC (`datetime64[ms, UTC]` in pandas,
+  `timestamp[ms, tz=UTC]` in Arrow, plain `datetime64[ms]` in the numpy API);
+- `<name>_offset`: the UTC offset that was stored in the file, as a duration
+  (`timedelta64[ms]` / `duration[ms]`). A missing value (`NaT` / `null`) means
+  the file did not record a time zone, while a zero offset means it recorded an
+  explicit zero offset (UTC); the two cases are kept apart.
+
+Because each offset is kept next to its own value, this is safe for columns
+that mix offsets, for daylight-saving changes (the two `01:30` readings of a
+fall-back stay distinct) and for `null` values, and it does not depend on how
+the data is split into batches. To write such data back, pass
+`datetime_layout="utc_offset"` to {func}`pyogrio.write_dataframe` or
+{func}`pyogrio.raw.write`: the UTC column and its offset column are combined
+again into the local wall clock time and offset that GDAL stores. Drivers that
+cannot store datetime fields are rejected, and values that GDAL cannot store
+without loss (sub-millisecond datetimes, or offsets that are not a multiple of
+15 minutes or outside -12:00..+14:00) raise a `ValueError` instead of being
+silently rounded.
+
 ## Dataset and layer creation options
 
 It is possible to use dataset and layer creation options available for a given
