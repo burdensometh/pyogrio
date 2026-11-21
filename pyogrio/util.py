@@ -6,6 +6,8 @@ from packaging.version import Version
 from pathlib import Path
 from urllib.parse import urlparse
 
+import numpy as np
+
 from pyogrio._ogr import MULTI_EXTENSIONS
 from pyogrio._vsi import vsimem_rmtree_toplevel as _vsimem_rmtree_toplevel
 
@@ -196,6 +198,19 @@ def _preprocess_options_key_value(options):
     return result
 
 
+def _get_shapely():
+    """Return the shapely module if version >= 2.0 is available, else None."""
+    try:
+        import shapely
+
+        if Version(shapely.__version__) < Version("2.0.0"):
+            return None
+    except ImportError:
+        return None
+
+    return shapely
+
+
 def _mask_to_wkb(mask):
     """Convert a Shapely mask geometry to WKB.
 
@@ -218,13 +233,7 @@ def _mask_to_wkb(mask):
     if mask is None:
         return mask
 
-    try:
-        import shapely
-
-        if Version(shapely.__version__) < Version("2.0.0"):
-            shapely = None
-    except ImportError:
-        shapely = None
+    shapely = _get_shapely()
 
     if not shapely:
         raise ValueError("'mask' parameter requires Shapely >= 2.0")
@@ -233,6 +242,79 @@ def _mask_to_wkb(mask):
         raise ValueError("'mask' parameter must be a Shapely geometry")
 
     return shapely.to_wkb(mask)
+
+
+def _get_exact_filter_geometry(bbox, mask):
+    """Get the shapely geometry used to verify spatial filter hits exactly.
+
+    GDAL is only guaranteed to apply an envelope (bounding box) based spatial
+    filter unless it was built with GEOS support. ``exact_geometry`` mode keeps
+    those (possibly too broad) results as candidates and verifies them against
+    the actual filter geometry, which is returned here.
+
+    Parameters
+    ----------
+    bbox : tuple of (xmin, ymin, xmax, ymax) or None
+    mask : Shapely geometry or None
+
+    Returns
+    -------
+    tuple(shapely module, shapely geometry)
+
+    Raises
+    ------
+    ValueError
+        raised if Shapely >= 2.0 is not available, if neither ``bbox`` nor
+        ``mask`` is provided, or if ``bbox`` is invalid
+
+    """
+    if bbox is not None and mask is not None:
+        raise ValueError("cannot set both 'bbox' and 'mask'")
+
+    if mask is not None:
+        # mask is validated when it is converted to WKB
+        shapely = _get_shapely()
+        if not shapely:
+            raise ValueError("'exact_geometry' requires Shapely >= 2.0")
+        if not isinstance(mask, shapely.Geometry):
+            raise ValueError("'mask' parameter must be a Shapely geometry")
+        return shapely, mask
+
+    if bbox is None:
+        raise ValueError("'exact_geometry' requires 'bbox' or 'mask'")
+
+    if not (isinstance(bbox, (tuple, list)) and len(bbox) == 4):
+        raise ValueError(f"Invalid bbox: {bbox}")
+
+    shapely = _get_shapely()
+    if not shapely:
+        raise ValueError("'exact_geometry' requires Shapely >= 2.0")
+
+    return shapely, shapely.box(*bbox)
+
+
+def _get_exact_hits(shapely, geometry_wkb, filter_geometry):
+    """Return a boolean mask of geometries that intersect ``filter_geometry``.
+
+    Parameters
+    ----------
+    shapely : module
+        The shapely module
+    geometry_wkb : ndarray of WKB bytes or None
+        Candidate geometries as returned from a read
+    filter_geometry : shapely geometry
+        Geometry to test intersection against
+
+    Returns
+    -------
+    ndarray of bool
+
+    """
+    if geometry_wkb is None or len(geometry_wkb) == 0:
+        return np.zeros(0, dtype=bool)
+
+    geometries = shapely.from_wkb(geometry_wkb, on_invalid="ignore")
+    return np.asarray(shapely.intersects(geometries, filter_geometry), dtype=bool)
 
 
 def vsimem_rmtree_toplevel(path: str | Path):

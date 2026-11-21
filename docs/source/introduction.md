@@ -219,6 +219,20 @@ will be returned; if GEOS is not available or not used by GDAL, all geometries
 with bounding boxes that intersect this bbox will be returned.
 {attr}`pyogrio.__gdal_geos_version__` will be `None` if GEOS is not detected.
 
+If exact filtering is required regardless of how GDAL is built, you can set
+`exact_geometry=True`. The `bbox` filter is then still used to select candidate
+features, and those candidates are verified against the actual `bbox` geometry
+using Shapely. Note that this requires Shapely >= 2.0 and that only the features
+whose geometry actually intersects the bbox are returned, so it may return fewer
+features than GDAL itself would.
+
+```python
+>>> read_dataframe('ne_10m_admin_0_countries.shp', bbox=(-140, 20, -100, 40), exact_geometry=True)
+```
+
+Note: with `exact_geometry=True`, `skip_features` and `max_features` are applied
+after this verification, i.e. to the features that actually intersect the filter.
+
 ## Filter records by a geometry
 
 You can use the `mask` parameter to select only those features that intersect
@@ -244,6 +258,17 @@ Note: if GEOS is present and used by GDAL, only geometries that intersect `mask`
 will be returned; if GEOS is not available or not used by GDAL, all geometries
 with bounding boxes that intersect the bounding box of `mask` will be returned.
 {attr}`pyogrio.__gdal_geos_version__` will be `None` if GEOS is not detected.
+
+Similarly as for `bbox`, you can pass `exact_geometry=True` to verify the
+candidates against the actual `mask` geometry using Shapely:
+
+```python
+>>> read_dataframe('ne_10m_admin_0_countries.shp', mask=mask, exact_geometry=True)
+```
+
+This also applies when the geometry is not read (`read_geometry=False`): the
+geometry is still used to verify the hits and only hidden from the output
+afterwards.
 
 ## Execute a sql query
 

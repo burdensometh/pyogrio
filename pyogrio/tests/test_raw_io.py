@@ -7,6 +7,7 @@ from io import BytesIO
 from zipfile import ZipFile
 
 import numpy as np
+import pyarrow as pa
 from numpy import array_equal
 
 import pyogrio
@@ -20,8 +21,9 @@ from pyogrio import (
 )
 from pyogrio._compat import GDAL_GE_37, GDAL_GE_313, HAS_PYARROW, HAS_SHAPELY
 from pyogrio.errors import DataLayerError, DataSourceError, FeatureError
-from pyogrio.raw import open_arrow, read, write
+from pyogrio.raw import open_arrow, read, read_arrow, write
 from pyogrio.tests.conftest import (
+    ALL_EXTS,
     DRIVER_EXT,
     DRIVERS,
     prepare_testfile,
@@ -363,6 +365,325 @@ def test_read_mask_where(naturalearth_lowres_all_ext):
     )[3]
     assert len(fields[3]) == 1
     assert np.array_equal(fields[3], ["CAN"])
+
+
+def _write_filter_candidates_file(path):
+    """Write a file with features whose bounding boxes overlap but whose
+    geometries do not intersect a probe filter, so exact filtering can be tested.
+    """
+    # U-shaped polygon: its bounding box includes the empty gap in its middle.
+    u_shape = shapely.Polygon(
+        [(0, 0), (10, 0), (10, 10), (6, 10), (6, 4), (4, 4), (4, 10), (0, 10), (0, 0)]
+    )
+    # square entirely inside the empty gap of the U-shaped polygon
+    gap = shapely.box(4.5, 5, 5.5, 6)
+    # square far away
+    far = shapely.box(100, 100, 101, 101)
+
+    geometry = np.array([shapely.to_wkb(g) for g in [u_shape, gap, far]], dtype=object)
+    write(
+        path,
+        geometry,
+        [np.array(["u", "gap", "far"], dtype=object)],
+        ["name"],
+        geometry_type="Polygon",
+        crs=None,
+    )
+    return path
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__mask(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    # mask lies strictly inside the gap of the U-shaped polygon. Depending on the
+    # driver / GDAL build, the bbox-based spatial filter may return the U-shaped
+    # polygon as a candidate even though it does not intersect the mask.
+    mask = shapely.box(4.6, 5.1, 5.4, 5.9)
+
+    exact = read(path, mask=mask, exact_geometry=True)[3]
+    assert exact[0].tolist() == ["gap"]
+
+    # the candidate filtering should never become stricter than the exact result
+    candidates = read(path, mask=mask)[3]
+    assert "gap" in candidates[0].tolist()
+
+    # hiding the geometry must not affect which features are returned
+    exact_no_geometry = read(path, mask=mask, exact_geometry=True, read_geometry=False)
+    assert exact_no_geometry[2] is None
+    assert exact_no_geometry[3][0].tolist() == ["gap"]
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__bbox(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+
+    # bbox that only covers the empty gap of the U-shaped polygon
+    bbox = (4.6, 5.1, 5.4, 5.9)
+    exact = read(path, bbox=bbox, exact_geometry=True)[3]
+    assert exact[0].tolist() == ["gap"]
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__skip_and_max_features(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+
+    # A multipolygon covering the gap and the far square: its bounding box also
+    # overlaps the U-shaped polygon, which is not an exact hit.
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    # The U-shaped polygon is not an exact hit, so skip/max_features should be
+    # applied to the exact hits ("gap" and "far") instead of the candidates.
+    hits = read(path, mask=mask, exact_geometry=True)[3][0].tolist()
+    assert sorted(hits) == ["far", "gap"]
+
+    # feature order may differ per driver (e.g. spatial index), so use the
+    # actual order to validate skip_features and max_features
+    for skip_features, max_features in [
+        (0, 1),
+        (1, None),
+        (1, 1),
+        (2, None),
+        (0, 0),
+    ]:
+        # max_features=0 means "no limit"
+        stop = None if not max_features else skip_features + max_features
+        expected = hits[skip_features:stop]
+
+        result = read(
+            path,
+            mask=mask,
+            exact_geometry=True,
+            skip_features=skip_features,
+            max_features=max_features,
+        )[3][0]
+        assert result.tolist() == expected
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", [ext for ext in ALL_EXTS if ext != ".geojsonl"])
+def test_read_exact_geometry__open_arrow(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+    expected = read(path, mask=mask, exact_geometry=True)[3][0].tolist()
+
+    # generic Arrow stream (PyCapsule protocol)
+    with open_arrow(path, mask=mask, exact_geometry=True) as (meta, stream):
+        table = pa.table(pa.RecordBatchReader.from_stream(stream))
+    assert table.column("name").to_pylist() == expected
+    assert (meta["geometry_name"] or "wkb_geometry") in table.column_names
+
+    # pyarrow RecordBatchReader, with and without geometry
+    for read_geometry in [True, False]:
+        with open_arrow(
+            path,
+            mask=mask,
+            exact_geometry=True,
+            read_geometry=read_geometry,
+            use_pyarrow=True,
+        ) as (meta, reader):
+            table = reader.read_all()
+        geometry_name = meta["geometry_name"] or "wkb_geometry"
+        assert table.column("name").to_pylist() == expected
+        assert (geometry_name in table.column_names) is read_geometry
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__read_geometry_false(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    kwargs = dict(mask=mask, exact_geometry=True, read_geometry=False)
+    _, _, geometry, field_data = read(path, **kwargs)
+    assert geometry is None
+    assert sorted(field_data[0].tolist()) == ["far", "gap"]
+
+    arrow_meta, table = read_arrow(path, **kwargs)
+    assert (arrow_meta["geometry_name"] or "wkb_geometry") not in table.column_names
+    assert sorted(table.column("name").to_pylist()) == ["far", "gap"]
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__matches_arrow(tmp_path, ext):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    for skip_features, max_features in [(0, None), (1, None), (0, 1), (1, 1)]:
+        kwargs = dict(
+            mask=mask,
+            exact_geometry=True,
+            return_fids=True,
+            skip_features=skip_features,
+            max_features=max_features,
+        )
+        _, fids, geometry, field_data = read(path, **kwargs)
+
+        arrow_meta, table = read_arrow(path, **kwargs)
+        arrow_fids = table.column(arrow_meta["fid_column"] or "OGC_FID").to_pylist()
+
+        assert fids.tolist() == arrow_fids
+        assert field_data[0].tolist() == table.column("name").to_pylist()
+        # geometry returned by both should correspond to the same features
+        assert len(geometry) == table.num_rows
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__same_as_existing_results(
+    tmp_path, ext, naturalearth_lowres
+):
+    # For filters that GDAL already evaluates exactly (e.g. a bbox), the exact
+    # mode must return the same features.
+    path = prepare_testfile(naturalearth_lowres, tmp_path, ext)
+    bbox = (-85, 8, -80, 10)
+
+    expected = read(path, bbox=bbox, return_fids=True)
+    actual = read(path, bbox=bbox, exact_geometry=True, return_fids=True)
+
+    assert actual[1].tolist() == expected[1].tolist()
+    assert actual[3][0].tolist() == expected[3][0].tolist()
+
+
+@requires_shapely
+def test_read_exact_geometry__null_geometry(tmp_path):
+    path = tmp_path / "null_geometry.gpkg"
+    write(
+        path,
+        np.array(
+            [shapely.to_wkb(shapely.box(0, 0, 1, 1)), None],
+            dtype=object,
+        ),
+        [np.array(["hit", "null"], dtype=object)],
+        ["name"],
+        geometry_type="Polygon",
+        crs=None,
+    )
+
+    # features without geometry cannot actually intersect the filter
+    bbox = (-1, -1, 2, 2)
+    result = read(path, bbox=bbox, exact_geometry=True)
+    assert result[3][0].tolist() == ["hit"]
+
+    _, table = read_arrow(path, bbox=bbox, exact_geometry=True)
+    assert table.column("name").to_pylist() == ["hit"]
+
+
+@requires_shapely
+@pytest.mark.parametrize("ext", ALL_EXTS)
+def test_read_exact_geometry__geometry_only_columns(tmp_path, ext):
+    # When only the geometry is requested, some drivers (e.g. GPKG) do not return
+    # the geometry data through the Arrow stream. The exact mode must still work.
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    expected = read(path, mask=mask, exact_geometry=True)[2]
+    arrow_meta, table = read_arrow(path, mask=mask, exact_geometry=True, columns=[])
+    geometry_name = arrow_meta["geometry_name"] or "wkb_geometry"
+
+    assert table.column_names == [geometry_name]
+    assert table.num_rows == len(expected)
+
+    geometries = shapely.from_wkb(
+        table.column(geometry_name).to_numpy(zero_copy_only=False)
+    )
+    assert sorted(shapely.to_wkb(geometries), key=bytes) == sorted(expected, key=bytes)
+
+
+@requires_shapely
+def test_read_exact_geometry__many_features(tmp_path):
+    # Exercise reading in multiple chunks
+    count = 1200
+    geometry = np.array(
+        [shapely.to_wkb(shapely.Point(i, 0)) for i in range(count)], dtype=object
+    )
+    path = tmp_path / "many_features.gpkg"
+    write(
+        path,
+        geometry,
+        [np.arange(count)],
+        ["idx"],
+        geometry_type="Point",
+        crs=None,
+    )
+
+    bbox = (0.5, -1, count - 0.5, 1)
+    # order is not guaranteed for drivers that use a spatial index
+    expected = list(range(1, count))
+    assert sorted(read(path, bbox=bbox, exact_geometry=True)[3][0]) == expected
+    assert (
+        sorted(
+            read_arrow(path, bbox=bbox, exact_geometry=True)[1]
+            .column("idx")
+            .to_pylist()
+        )
+        == expected
+    )
+
+    # skip_features / max_features that span chunks
+    for skip_features, max_features in [(1100, 50), (1100, None), (0, 700)]:
+        kwargs = dict(
+            bbox=bbox,
+            exact_geometry=True,
+            skip_features=skip_features,
+            max_features=max_features,
+            return_fids=True,
+        )
+        expected = read(path, **kwargs)[3][0].tolist()
+        arrow = read_arrow(path, **kwargs)[1]
+        assert expected == arrow.column("idx").to_pylist()
+
+
+@requires_shapely
+def test_read_exact_geometry__no_filter(naturalearth_lowres):
+    with pytest.raises(ValueError, match="'exact_geometry' requires 'bbox' or 'mask'"):
+        read(naturalearth_lowres, exact_geometry=True)
+
+
+@requires_shapely
+def test_read_exact_geometry__fids(naturalearth_lowres):
+    with pytest.raises(ValueError, match="cannot be combined with 'fids'"):
+        read(
+            naturalearth_lowres,
+            bbox=(-140, 20, -100, 45),
+            fids=[1],
+            exact_geometry=True,
+        )
+
+
+@requires_shapely
+def test_read_exact_geometry__bbox_and_mask(naturalearth_lowres):
+    with pytest.raises(ValueError, match="cannot set both 'bbox' and 'mask'"):
+        read(
+            naturalearth_lowres,
+            bbox=(-85, 8, -80, 10),
+            mask=shapely.Point(-105, 55),
+            exact_geometry=True,
+        )
+
+
+@requires_shapely
+def test_read_exact_geometry__no_geometry_layer(tmp_path):
+    path = tmp_path / "no_geometry.gpkg"
+    write(
+        path,
+        layer="no_geometry",
+        geometry=None,
+        field_data=[np.array(["a", "b"], dtype=object)],
+        fields=["col"],
+    )
+
+    # a nonspatial layer cannot have features that intersect the filter
+    result = read(path, bbox=(0, 0, 1, 1), exact_geometry=True)
+    assert result[2] is None
+    assert result[3][0].tolist() == []
+
+    _, table = read_arrow(path, bbox=(0, 0, 1, 1), exact_geometry=True)
+    assert table.num_rows == 0
+    assert table.column("col").to_pylist() == []
 
 
 def test_read_fids(naturalearth_lowres):

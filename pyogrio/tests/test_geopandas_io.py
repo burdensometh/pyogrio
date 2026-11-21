@@ -51,6 +51,7 @@ from pyogrio.tests.conftest import (
     requires_gdal_geos,
     requires_pyarrow_api,
     requires_pyproj,
+    requires_shapely,
 )
 
 import pytest
@@ -1563,6 +1564,93 @@ def test_read_mask_where(naturalearth_lowres_all_ext, use_arrow):
     )
     assert len(df) == 1
     assert np.array_equal(df.iso_a3, ["CAN"])
+
+
+def _write_filter_candidates_file(path):
+    """Write a file with features whose bounding boxes overlap but whose
+    geometries do not intersect a probe filter, so exact filtering can be tested.
+    """
+    # U-shaped polygon: its bounding box includes the empty gap in its middle.
+    u_shape = shapely.Polygon(
+        [(0, 0), (10, 0), (10, 10), (6, 10), (6, 4), (4, 4), (4, 10), (0, 10), (0, 0)]
+    )
+    # square entirely inside the empty gap of the U-shaped polygon
+    gap = shapely.box(4.5, 5, 5.5, 6)
+    # square far away
+    far = shapely.box(100, 100, 101, 101)
+
+    gdf = gp.GeoDataFrame(
+        {"name": ["u", "gap", "far"]}, geometry=[u_shape, gap, far], crs="EPSG:4326"
+    )
+    gdf.to_file(path, engine="pyogrio")
+    return path
+
+
+@requires_shapely
+@pytest.mark.parametrize("use_arrow", [False, True])
+@pytest.mark.parametrize("ext", [".gpkg", ".shp", ".fgb"])
+def test_read_exact_geometry(tmp_path, ext, use_arrow):
+    path = _write_filter_candidates_file(tmp_path / f"filter_candidates{ext}")
+    mask = shapely.box(4.6, 5.1, 5.4, 5.9)
+
+    df = read_dataframe(path, use_arrow=use_arrow, mask=mask, exact_geometry=True)
+    assert df.name.tolist() == ["gap"]
+    assert isinstance(df, gp.GeoDataFrame)
+
+    # hiding the geometry must still use it to verify the exact hits
+    df_no_geometry = read_dataframe(
+        path, use_arrow=use_arrow, mask=mask, exact_geometry=True, read_geometry=False
+    )
+    assert not isinstance(df_no_geometry, gp.GeoDataFrame)
+    assert df_no_geometry.name.tolist() == ["gap"]
+
+
+@requires_shapely
+@pytest.mark.parametrize("use_arrow", [False, True])
+def test_read_exact_geometry__skip_and_max_features(tmp_path, use_arrow):
+    path = _write_filter_candidates_file(tmp_path / "filter_candidates.gpkg")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    hits = read_dataframe(path, use_arrow=use_arrow, mask=mask, exact_geometry=True)
+    hit_names = hits.name.tolist()
+    assert sorted(hit_names) == ["far", "gap"]
+
+    for skip_features, max_features in [(0, 1), (1, None), (1, 1), (2, None)]:
+        stop = None if not max_features else skip_features + max_features
+        expected = hit_names[skip_features:stop]
+
+        df = read_dataframe(
+            path,
+            use_arrow=use_arrow,
+            mask=mask,
+            exact_geometry=True,
+            skip_features=skip_features,
+            max_features=max_features,
+        )
+        assert df.name.tolist() == expected
+
+
+@requires_shapely
+@pytest.mark.parametrize("use_arrow", [False, True])
+def test_read_exact_geometry__same_fids_and_order(tmp_path, use_arrow):
+    path = _write_filter_candidates_file(tmp_path / "filter_candidates.gpkg")
+    mask = shapely.union(shapely.box(4.5, 5, 5.5, 6), shapely.box(100, 100, 101, 101))
+
+    df_no_arrow = read_dataframe(
+        path, use_arrow=False, mask=mask, exact_geometry=True, fid_as_index=True
+    )
+    df_arrow = read_dataframe(
+        path, use_arrow=True, mask=mask, exact_geometry=True, fid_as_index=True
+    )
+
+    assert df_no_arrow.index.tolist() == df_arrow.index.tolist()
+    assert df_no_arrow.name.tolist() == df_arrow.name.tolist()
+
+
+@requires_shapely
+def test_read_exact_geometry__no_filter(naturalearth_lowres_all_ext):
+    with pytest.raises(ValueError, match="'exact_geometry' requires 'bbox' or 'mask'"):
+        read_dataframe(naturalearth_lowres_all_ext, exact_geometry=True)
 
 
 @pytest.mark.parametrize("fids", [[1, 5, 10], np.array([1, 5, 10], dtype=np.int64)])

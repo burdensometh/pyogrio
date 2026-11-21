@@ -157,6 +157,7 @@ def read_dataframe(
     arrow_to_pandas_kwargs=None,
     datetime_as_string=False,
     mixed_offsets_as_utc=True,
+    exact_geometry=False,
     **kwargs,
 ):
     """Read from an OGR data source to a GeoPandas GeoDataFrame or Pandas DataFrame.
@@ -313,6 +314,15 @@ def read_dataframe(
           option, but you lose the functionality of a datetime64 column.
 
         If ``datetime_as_string`` is True, this option is ignored.
+    exact_geometry : bool, optional (default: False)
+        If True, only return features whose actual geometry intersects the
+        ``bbox`` or ``mask`` filter. This verifies the features returned by
+        GDAL against the actual filter geometry using Shapely, which is useful
+        when GDAL only applies a bounding box based spatial filter (e.g. when it
+        was not built with GEOS support). ``skip_features`` and ``max_features``
+        are applied to the verified hits. Requires Shapely >= 2.0 and cannot be
+        used without ``bbox`` or ``mask``. Has the same effect for ``use_arrow``
+        True and False.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR. Invalid
@@ -396,6 +406,7 @@ def read_dataframe(
         sql_dialect=sql_dialect,
         return_fids=fid_as_index,
         datetime_as_string=True,
+        exact_geometry=exact_geometry,
         **kwargs,
     )
 

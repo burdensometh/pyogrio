@@ -1,14 +1,19 @@
 """Low level functions to read and write OGR data sources."""
 
+import contextlib
 import warnings
 from io import BytesIO
 from pathlib import Path
+
+import numpy as np
 
 from pyogrio._compat import HAS_ARROW_WRITE_API, HAS_PYARROW
 from pyogrio._env import GDALEnv
 from pyogrio.core import detect_write_driver
 from pyogrio.errors import DataSourceError
 from pyogrio.util import (
+    _get_exact_filter_geometry,
+    _get_exact_hits,
     _mask_to_wkb,
     _preprocess_options_key_value,
     get_vsi_path_or_buffer,
@@ -36,6 +41,354 @@ DRIVERS_NO_MIXED_DIMENSIONS = {
 }
 
 
+def _validate_exact_geometry_args(bbox, mask, fids):
+    """Validate the arguments for ``exact_geometry`` filtering."""
+    if bbox is None and mask is None:
+        raise ValueError("'exact_geometry' requires 'bbox' or 'mask'")
+
+    if fids is not None:
+        raise ValueError("'exact_geometry' cannot be combined with 'fids'")
+
+
+def _validate_read_geometry_columns(read_geometry, return_fids, columns):
+    """Validate that there is something to return from a read."""
+    if not (read_geometry or return_fids or columns is None or len(columns) > 0):
+        raise ValueError(
+            "at least one of read_geometry or return_fids must be True or columns "
+            "must be None or non-empty"
+        )
+
+
+def _num_features(fids, field_data):
+    """Determine the number of features from read results."""
+    if fids is not None:
+        return len(fids)
+    if field_data:
+        return len(field_data[0])
+    return 0
+
+
+def _select_exact_hits(shapely, geometries, filter_geometry, num_features):
+    """Get a boolean mask for the features whose geometry intersects the filter.
+
+    ``geometries`` is an array of WKB values as returned by a read, or None if
+    the layer does not have a geometry column (in which case no features can
+    actually intersect the filter).
+    """
+    if geometries is None:
+        return np.zeros(num_features, dtype=bool)
+
+    return _get_exact_hits(shapely, geometries, filter_geometry)
+
+
+def _read_exact_geometry(
+    path_or_buffer,
+    shapely,
+    filter_geometry,
+    *,
+    layer,
+    encoding,
+    columns,
+    read_geometry,
+    force_2d,
+    skip_features,
+    max_features,
+    where,
+    bbox,
+    mask,
+    sql,
+    sql_dialect,
+    return_fids,
+    datetime_as_string,
+    dataset_kwargs,
+):
+    """Read features and keep only those that actually intersect the filter.
+
+    The ``bbox`` / ``mask`` filter is applied as usual so that GDAL only returns
+    candidate features, then the returned geometries are verified against the
+    actual filter geometry. ``skip_features`` and ``max_features`` are applied to
+    the verified hits, not to the candidates.
+    """
+    if skip_features < 0:
+        raise ValueError("'skip_features' must be >= 0")
+
+    if max_features is not None and max_features < 0:
+        raise ValueError("'max_features' must be >= 0")
+
+    _validate_read_geometry_columns(read_geometry, return_fids, columns)
+
+    # Always read the geometry so candidate features can be verified, even if the
+    # caller ultimately does not want geometry returned (it is hidden below).
+    meta, fids, geometries, field_data = ogr_read(
+        get_vsi_path_or_buffer(path_or_buffer),
+        layer=layer,
+        encoding=encoding,
+        columns=columns,
+        read_geometry=True,
+        force_2d=force_2d,
+        # skip_features / max_features are applied after verification
+        skip_features=0,
+        max_features=0,
+        where=where,
+        bbox=bbox,
+        mask=_mask_to_wkb(mask),
+        fids=None,
+        sql=sql,
+        sql_dialect=sql_dialect,
+        return_fids=return_fids,
+        dataset_kwargs=dataset_kwargs,
+        datetime_as_string=datetime_as_string,
+    )
+
+    if geometries is not None:
+        num_candidates = len(geometries)
+    else:
+        num_candidates = _num_features(fids, field_data)
+
+    hits = _select_exact_hits(shapely, geometries, filter_geometry, num_candidates)
+    idx = np.flatnonzero(hits)
+
+    if skip_features:
+        idx = idx[skip_features:]
+
+    if max_features is not None and max_features > 0:
+        idx = idx[:max_features]
+
+    if fids is not None:
+        fids = fids[idx]
+
+    if geometries is not None:
+        if read_geometry:
+            geometries = geometries[idx]
+        else:
+            # only read to verify the hits, hide it from the output
+            geometries = None
+
+    field_data = [values[idx] for values in field_data]
+
+    return meta, fids, geometries, field_data
+
+
+def _arrow_wkb_from_column(pa, column):
+    """Get the WKB values of an Arrow geometry column as a numpy array."""
+    dtype = column.type
+
+    if isinstance(dtype, pa.ExtensionType) or pa.types.is_large_binary(dtype):
+        column = column.cast(pa.binary())
+        dtype = column.type
+
+    if not pa.types.is_binary(dtype):
+        raise RuntimeError(
+            f"Unsupported Arrow geometry type for 'exact_geometry': {dtype}"
+        )
+
+    return column.to_numpy(zero_copy_only=False)
+
+
+def _filter_arrow_batches(
+    pa,
+    reader,
+    shapely,
+    filter_geometry,
+    geometry_index,
+    skip_features,
+    max_features,
+    keep_indices,
+    schema,
+):
+    """Generate record batches with only features that intersect the filter."""
+    remaining_skip = skip_features
+    remaining_max = max_features if max_features and max_features > 0 else None
+
+    for batch in reader:
+        wkb = _arrow_wkb_from_column(pa, batch.column(geometry_index))
+        hits = np.asarray(
+            shapely.intersects(
+                shapely.from_wkb(wkb, on_invalid="ignore"), filter_geometry
+            ),
+            dtype=bool,
+        )
+        batch = batch.filter(pa.array(hits))
+
+        if remaining_skip:
+            if batch.num_rows <= remaining_skip:
+                remaining_skip -= batch.num_rows
+                continue
+
+            batch = batch.slice(remaining_skip)
+            remaining_skip = 0
+
+        if remaining_max is not None:
+            if remaining_max <= 0:
+                break
+
+            if batch.num_rows > remaining_max:
+                batch = batch.slice(0, remaining_max)
+
+            remaining_max -= batch.num_rows
+
+        if keep_indices is not None:
+            # Select by position instead of by name, because some layers can have
+            # duplicate column names (e.g. an attribute named like the FID
+            # column), which `RecordBatch.select` does not support.
+            arrays = [batch.column(i) for i in keep_indices]
+            batch = pa.RecordBatch.from_arrays(arrays, schema=schema)
+
+        if batch.num_rows:
+            yield batch
+
+
+class _PyArrowStream:
+    """Minimal Arrow PyCapsule Protocol wrapper around a pyarrow reader."""
+
+    def __init__(self, reader):
+        self._reader = reader
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        if requested_schema is not None:
+            raise NotImplementedError("requested_schema is not supported")
+        return self._reader.__arrow_c_stream__()
+
+
+def _apply_exact_arrow_filter(
+    meta,
+    reader,
+    shapely,
+    filter_geometry,
+    skip_features,
+    max_features,
+    read_geometry,
+    return_fids,
+):
+    """Wrap a pyarrow reader so only exact filter hits are returned.
+
+    The FID column is always part of the underlying stream (needed to make some
+    drivers, e.g. GPKG, return the geometry data when no attribute columns are
+    requested). It is dropped again from the output if the caller did not ask
+    for FIDs.
+    """
+    import pyarrow as pa
+
+    geometry_column = meta["geometry_name"] or "wkb_geometry"
+    geometry_index = reader.schema.get_field_index(geometry_column)
+    if geometry_index == -1:
+        # Nonspatial layer: no feature can actually intersect the filter, which
+        # matches the behavior of the non-Arrow read implementation.
+        return pa.RecordBatchReader.from_batches(reader.schema, iter(()))
+
+    drop_indices = []
+    if not return_fids:
+        # the FID column is only included in the underlying stream for the
+        # verification of the hits, so drop it again if not requested. GDAL adds
+        # it as the first column, but fall back to a lookup by name otherwise.
+        fid_name = meta["fid_column"]
+        if len(reader.schema) and reader.schema.field(0).name == fid_name:
+            drop_indices.append(0)
+        else:
+            fid_index = reader.schema.get_field_index(fid_name)
+            if fid_index != -1:
+                drop_indices.append(fid_index)
+
+    if not read_geometry:
+        drop_indices.append(geometry_index)
+
+    if drop_indices:
+        keep_indices = [i for i in range(len(reader.schema)) if i not in drop_indices]
+        schema = pa.schema([reader.schema.field(i) for i in keep_indices])
+    else:
+        keep_indices = None
+        schema = reader.schema
+
+    return pa.RecordBatchReader.from_batches(
+        schema,
+        _filter_arrow_batches(
+            pa,
+            reader,
+            shapely,
+            filter_geometry,
+            geometry_index,
+            skip_features,
+            max_features,
+            keep_indices,
+            schema,
+        ),
+    )
+
+
+@contextlib.contextmanager
+def _open_arrow_exact_geometry(
+    path_or_buffer,
+    shapely,
+    filter_geometry,
+    *,
+    layer,
+    encoding,
+    columns,
+    read_geometry,
+    force_2d,
+    skip_features,
+    max_features,
+    where,
+    bbox,
+    mask,
+    sql,
+    sql_dialect,
+    return_fids,
+    batch_size,
+    use_pyarrow,
+    datetime_as_string,
+    dataset_kwargs,
+):
+    """Open an Arrow stream that only returns exact filter hits."""
+    if not HAS_PYARROW:
+        raise RuntimeError("'exact_geometry' for the Arrow interface requires pyarrow")
+
+    _validate_read_geometry_columns(read_geometry, return_fids, columns)
+
+    # The geometry is always read so the candidates can be verified; it is
+    # dropped again from the output if the caller did not ask for it.
+    with ogr_open_arrow(
+        get_vsi_path_or_buffer(path_or_buffer),
+        layer=layer,
+        encoding=encoding,
+        columns=columns,
+        read_geometry=True,
+        force_2d=force_2d,
+        # skip_features / max_features are applied after verification
+        skip_features=0,
+        max_features=0,
+        where=where,
+        bbox=bbox,
+        mask=_mask_to_wkb(mask),
+        fids=None,
+        sql=sql,
+        sql_dialect=sql_dialect,
+        # FIDs are always included in the underlying stream: needed to make some
+        # drivers (e.g. GPKG) return the geometry data when no attribute columns
+        # are requested; dropped again from the output if not requested.
+        return_fids=True,
+        dataset_kwargs=dataset_kwargs,
+        batch_size=batch_size,
+        use_pyarrow=True,
+        datetime_as_string=datetime_as_string,
+    ) as (meta, reader):
+        reader = _apply_exact_arrow_filter(
+            meta,
+            reader,
+            shapely,
+            filter_geometry,
+            skip_features,
+            max_features,
+            read_geometry,
+            return_fids,
+        )
+
+        if use_pyarrow:
+            yield meta, reader
+        else:
+            yield meta, _PyArrowStream(reader)
+
+
 def read(
     path_or_buffer,
     /,
@@ -54,6 +407,7 @@ def read(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    exact_geometry=False,
     **kwargs,
 ):
     """Read OGR data source into numpy arrays.
@@ -153,6 +507,18 @@ def read(
         If True, will return datetime dtypes as detected by GDAL as a string
         array (which can be used to extract time zone info), instead of
         a datetime64 array.
+    exact_geometry : bool, optional (default: False)
+        If True, only return features whose actual geometry intersects the
+        ``bbox`` or ``mask`` filter, instead of relying on the spatial filter
+        that GDAL applies. GDAL may only compare bounding boxes when it was not
+        built with GEOS support or when the driver does not support exact
+        filtering, which results in features whose bounding boxes overlap the
+        filter but whose geometries do not actually intersect it. When enabled,
+        the ``bbox`` / ``mask`` filter is still used to select candidate
+        features, and the candidates are then verified against the actual
+        filter geometry using Shapely. ``skip_features`` and ``max_features``
+        are applied to the verified hits. Requires Shapely >= 2.0 and cannot
+        be used without ``bbox`` or ``mask``.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR.  Invalid
@@ -197,6 +563,30 @@ def read(
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
 
+    if exact_geometry:
+        _validate_exact_geometry_args(bbox, mask, fids)
+        shapely, filter_geometry = _get_exact_filter_geometry(bbox, mask)
+        return _read_exact_geometry(
+            path_or_buffer,
+            shapely,
+            filter_geometry,
+            layer=layer,
+            encoding=encoding,
+            columns=columns,
+            read_geometry=read_geometry,
+            force_2d=force_2d,
+            skip_features=skip_features,
+            max_features=max_features,
+            where=where,
+            bbox=bbox,
+            mask=mask,
+            sql=sql,
+            sql_dialect=sql_dialect,
+            return_fids=return_fids,
+            datetime_as_string=datetime_as_string,
+            dataset_kwargs=dataset_kwargs,
+        )
+
     return ogr_read(
         get_vsi_path_or_buffer(path_or_buffer),
         layer=layer,
@@ -236,6 +626,7 @@ def read_arrow(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    exact_geometry=False,
     **kwargs,
 ):
     """Read OGR data source into a pyarrow Table.
@@ -277,6 +668,38 @@ def read_arrow(
 
     if max_features is not None and max_features < 0:
         raise ValueError("'max_features' must be >= 0")
+
+    if exact_geometry:
+        _validate_exact_geometry_args(bbox, mask, fids)
+
+        shapely, filter_geometry = _get_exact_filter_geometry(bbox, mask)
+
+        # skip_features and max_features are applied to the verified hits, so they
+        # are handled by the exact filtering logic instead of by GDAL.
+        with _open_arrow_exact_geometry(
+            path_or_buffer,
+            shapely,
+            filter_geometry,
+            layer=layer,
+            encoding=encoding,
+            columns=columns,
+            read_geometry=read_geometry,
+            force_2d=force_2d,
+            skip_features=skip_features,
+            max_features=max_features,
+            where=where,
+            bbox=bbox,
+            mask=mask,
+            sql=sql,
+            sql_dialect=sql_dialect,
+            return_fids=return_fids,
+            batch_size=kwargs.pop("batch_size", 65_536),
+            use_pyarrow=True,
+            datetime_as_string=datetime_as_string,
+            dataset_kwargs=_preprocess_options_key_value(kwargs) if kwargs else {},
+        ) as source:
+            meta, reader = source
+            return meta, reader.read_all()
 
     # limit batch size to max_features if set
     if "batch_size" in kwargs:
@@ -367,6 +790,7 @@ def open_arrow(
     batch_size=65_536,
     use_pyarrow=False,
     datetime_as_string=False,
+    exact_geometry=False,
     **kwargs,
 ):
     """Open OGR data source as a stream of Arrow record batches.
@@ -446,6 +870,33 @@ def open_arrow(
 
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
+
+    if exact_geometry:
+        _validate_exact_geometry_args(bbox, mask, fids)
+
+        shapely, filter_geometry = _get_exact_filter_geometry(bbox, mask)
+        return _open_arrow_exact_geometry(
+            path_or_buffer,
+            shapely,
+            filter_geometry,
+            layer=layer,
+            encoding=encoding,
+            columns=columns,
+            read_geometry=read_geometry,
+            force_2d=force_2d,
+            skip_features=skip_features,
+            max_features=max_features,
+            where=where,
+            bbox=bbox,
+            mask=mask,
+            sql=sql,
+            sql_dialect=sql_dialect,
+            return_fids=return_fids,
+            batch_size=batch_size,
+            use_pyarrow=use_pyarrow,
+            datetime_as_string=datetime_as_string,
+            dataset_kwargs=dataset_kwargs,
+        )
 
     return ogr_open_arrow(
         get_vsi_path_or_buffer(path_or_buffer),

@@ -2,6 +2,19 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add an ``exact_geometry`` keyword to ``read_dataframe``, ``read``,
+    ``read_arrow`` and ``open_arrow``. When using a ``bbox`` or ``mask`` filter,
+    the features returned by GDAL are only candidates if GDAL is not able to
+    apply an exact spatial filter (e.g. when it was not built with GEOS
+    support). With ``exact_geometry=True``, the candidates are verified against
+    the actual filter geometry using Shapely, so only features whose geometry
+    actually intersects the filter are returned. ``skip_features`` and
+    ``max_features`` are applied to the verified hits, and the same FIDs and
+    record order are returned for the Arrow and non-Arrow implementations. The
+    geometry is also verified before it is hidden when ``read_geometry=False``.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries
