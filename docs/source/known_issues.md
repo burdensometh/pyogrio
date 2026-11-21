@@ -4,13 +4,44 @@
 
 Some data sources support NULL or otherwise unset field values. These cannot be
 properly stored into the ndarray for certain types. If NULL or unset values are
-encountered, the following occurs:
+encountered, the following occurs by default (the legacy behaviour):
 
 -   If the field is a string type, NULL values are represented as None
 -   If the field is a boolean or an integer type (np.int32, np.int64), the field
     data are re-cast to np.float64 values, and NULL values are represented as
-    np.nan
+    np.nan. Note that this can lose precision for large int64 values (e.g. FIDs
+    or business codes larger than the exact-integer range of float64).
 -   If the field is a date or datetime type, the field is set as np.datetime64('NaT')
+
+### Fidelity read mode (`use_nullable_dtypes=True`)
+
+To avoid the precision loss and type changes described above, all read functions
+accept `use_nullable_dtypes=True`. In this mode, NULL values of integer and
+boolean fields are tracked independently of the field values in separate boolean
+mask arrays, so the original integer/boolean dtype is preserved and large
+integers are read back exactly:
+
+-   {func}`~pyogrio.raw.read` returns an additional element: a list of boolean
+    mask arrays aligned with the field arrays (entries are `None` for field types
+    that do not need a mask, such as floating point or string fields). A mask
+    value of `True` marks a NULL; a legitimate zero value is never treated as
+    missing.
+-   {func}`~pyogrio.read_dataframe` returns integer and boolean columns using the
+    pandas nullable dtypes (`Int8`/`Int16`/`Int32`/`Int64` and `boolean`), with
+    `pd.NA` representing missing values. With `use_arrow=True`, the equivalent
+    nullable dtype is obtained through the Arrow-to-pandas conversion.
+-   The Arrow interface ({func}`~pyogrio.raw.read_arrow`,
+    {func}`~pyogrio.raw.open_arrow`) always preserves NULLs natively: integer and
+    boolean Arrow columns keep their logical type and use Arrow's own null
+    representation, so no information is lost there regardless of the flag.
+
+Data read this way can be written back to a layer that supports the same field
+types using {func}`~pyogrio.raw.write` (pass the masks as `field_mask`) or
+{func}`~pyogrio.write_dataframe`; values and NULL positions are preserved
+itemwise, including zeros and large integers.
+
+The default (`use_nullable_dtypes=False`) retains the legacy float64/NaN
+behaviour for backwards compatibility.
 
 Note: detection of NULL or otherwise unset field values is limited to the subset
 of records that are read from the data layer, which means that reading different

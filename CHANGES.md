@@ -2,6 +2,21 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add a `use_nullable_dtypes` option to `read()`, `read_arrow()` /
+    `open_arrow()` and `read_dataframe()` to read integer and boolean columns
+    without losing their logical type when they contain NULL values. The numpy
+    based `read()` now returns separate boolean null masks (an additional tuple
+    element) that keep NULL information independent of the values, so large
+    int64 values (e.g. FIDs or business codes) are preserved exactly and
+    legitimate zeros are never confused with missing values. `read_dataframe()`
+    returns pandas nullable dtypes (`Int16`/`Int32`/`Int64`, `boolean`), and the
+    Arrow path maps the native nullable Arrow integer/boolean types to the same
+    pandas dtypes. Data read this way round-trips itemwise through `write()` /
+    `write_dataframe()` to layers supporting those types. The previous
+    float64/NaN behaviour remains the default for backwards compatibility (#728).
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

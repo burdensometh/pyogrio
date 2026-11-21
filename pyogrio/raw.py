@@ -54,6 +54,7 @@ def read(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    use_nullable_dtypes=False,
     **kwargs,
 ):
     """Read OGR data source into numpy arrays.
@@ -153,6 +154,17 @@ def read(
         If True, will return datetime dtypes as detected by GDAL as a string
         array (which can be used to extract time zone info), instead of
         a datetime64 array.
+    use_nullable_dtypes : bool, optional (default: False)
+        If True, NULL values in integer and boolean fields are returned in
+        separate boolean mask arrays instead of casting the field data to
+        ``float64`` with ``np.nan`` placeholders. This preserves the original
+        integer/boolean dtype (and the exact values, e.g. large int64 FIDs or
+        business codes), and keeps the information about nulls independent of
+        the values, so a legitimate zero is never confused with a missing
+        value. The mask arrays are returned as an additional element of the
+        result tuple (see below); entries are ``None`` for field types that do
+        not need a mask. When False, the legacy behaviour (cast to float64 and
+        use NaN for nulls) is retained for backwards compatibility.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR.  Invalid
@@ -160,13 +172,14 @@ def read(
 
     Returns
     -------
-    (dict, fids, geometry, data fields)
+    (dict, fids, geometry, data fields) or (dict, fids, geometry, data fields, masks)
         Returns a tuple of meta information about the data source in a dict,
         an ndarray of FIDs corresponding to the features that were read or None
         (if return_fids is False),
         an ndarray of geometry objects or None (if data source does not include
         geometry or read_geometry is False), a tuple of ndarrays for each field
-        in the data layer.
+        in the data layer, and, only if ``use_nullable_dtypes=True``, a list of
+        boolean ndarrays (or None entries) holding the null masks of the fields.
 
         Meta is: {
             "crs": "<crs>",
@@ -197,7 +210,7 @@ def read(
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
 
-    return ogr_read(
+    result = ogr_read(
         get_vsi_path_or_buffer(path_or_buffer),
         layer=layer,
         encoding=encoding,
@@ -215,7 +228,14 @@ def read(
         return_fids=return_fids,
         dataset_kwargs=dataset_kwargs,
         datetime_as_string=datetime_as_string,
+        use_nullable_dtypes=use_nullable_dtypes,
     )
+
+    if use_nullable_dtypes:
+        return result
+
+    # backwards-compatible 4-tuple without the field masks
+    return result[:4]
 
 
 def read_arrow(
@@ -236,11 +256,21 @@ def read_arrow(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    use_nullable_dtypes=False,
     **kwargs,
 ):
     """Read OGR data source into a pyarrow Table.
 
     See docstring of `read` for parameters.
+
+    Notes
+    -----
+    The Arrow data model natively supports null values for integer and boolean
+    columns, so nulls are always preserved in the returned table without losing
+    the original logical type. The ``use_nullable_dtypes`` flag does not change
+    the Arrow table itself; it only affects the conversion to pandas when using
+    :func:`pyogrio.read_dataframe` (mapping Arrow integer/boolean types to the
+    pandas nullable ``Int8``/``Int16``/``Int32``/``Int64``/``boolean`` dtypes).
 
     Returns
     -------
@@ -311,6 +341,7 @@ def read_arrow(
         batch_size=batch_size,
         use_pyarrow=True,
         datetime_as_string=datetime_as_string,
+        use_nullable_dtypes=use_nullable_dtypes,
         **kwargs,
     ) as source:
         meta, reader = source
@@ -367,6 +398,7 @@ def open_arrow(
     batch_size=65_536,
     use_pyarrow=False,
     datetime_as_string=False,
+    use_nullable_dtypes=False,
     **kwargs,
 ):
     """Open OGR data source as a stream of Arrow record batches.
@@ -398,6 +430,13 @@ def open_arrow(
     datetime_as_string : bool, optional (default: False)
         If True, will return datetime dtypes as detected by GDAL as strings,
         as Arrow doesn't support e.g. mixed time zones.
+    use_nullable_dtypes : bool, optional (default: False)
+        The Arrow stream always preserves nulls in integer and boolean columns
+        using Arrow's native null representation (the original logical type is
+        not lost). This flag is therefore only consumed by higher level
+        helpers such as :func:`pyogrio.read_dataframe`, where it controls the
+        mapping to pandas nullable dtypes; it does not alter the returned
+        Arrow stream and is not passed to GDAL as an open option.
 
     Examples
     --------

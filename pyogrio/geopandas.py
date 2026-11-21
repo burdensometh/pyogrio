@@ -157,6 +157,7 @@ def read_dataframe(
     arrow_to_pandas_kwargs=None,
     datetime_as_string=False,
     mixed_offsets_as_utc=True,
+    use_nullable_dtypes=False,
     **kwargs,
 ):
     """Read from an OGR data source to a GeoPandas GeoDataFrame or Pandas DataFrame.
@@ -313,6 +314,18 @@ def read_dataframe(
           option, but you lose the functionality of a datetime64 column.
 
         If ``datetime_as_string`` is True, this option is ignored.
+    use_nullable_dtypes : bool, optional (default: False)
+        If True, integer and boolean columns that contain NULL values are
+        returned using pandas nullable dtypes (``Int8``/``Int16``/``Int32``/
+        ``Int64`` and ``boolean``) instead of being cast to ``float64`` with
+        ``NaN`` placeholders. This preserves large integers exactly (no loss
+        of precision through the float conversion) and distinguishes NULL
+        values from legitimate zeros. When reading without Arrow, all
+        integer/boolean columns use the corresponding nullable dtype (whether
+        or not they contain nulls); when reading with Arrow, the equivalent
+        nullable dtype is obtained through the Arrow-to-pandas conversion.
+        The default False retains the legacy behaviour for backwards
+        compatibility.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR. Invalid
@@ -396,6 +409,7 @@ def read_dataframe(
         sql_dialect=sql_dialect,
         return_fids=fid_as_index,
         datetime_as_string=True,
+        use_nullable_dtypes=use_nullable_dtypes,
         **kwargs,
     )
 
@@ -407,7 +421,30 @@ def read_dataframe(
         # split_blocks and self_destruct decrease memory usage, but have as side effect
         # that accessing table afterwards causes crash, so del table to avoid.
         kwargs = {"self_destruct": True}
-        if PANDAS_GE_30:
+
+        def _arrow_types_mapper(arrow_type):
+            if use_nullable_dtypes:
+                if pa.types.is_boolean(arrow_type):
+                    return pd.BooleanDtype()
+                if pa.types.is_int8(arrow_type):
+                    return pd.Int8Dtype()
+                if pa.types.is_int16(arrow_type):
+                    return pd.Int16Dtype()
+                if pa.types.is_int32(arrow_type):
+                    return pd.Int32Dtype()
+                if pa.types.is_int64(arrow_type):
+                    return pd.Int64Dtype()
+            if pa.types.is_string(arrow_type) or pa.types.is_large_string(arrow_type):
+                return pd.StringDtype(na_value=np.nan)
+            if hasattr(pa.types, "is_json") and pa.types.is_json(arrow_type):
+                return pd.StringDtype(na_value=np.nan)
+            return None
+
+        if use_nullable_dtypes:
+            # map integer/boolean Arrow types to pandas nullable dtypes, and
+            # keep the string mapping for the string/JSON types below
+            kwargs["types_mapper"] = _arrow_types_mapper
+        elif PANDAS_GE_30:
             # starting with pyarrow 19.0, pyarrow will correctly handle this themselves,
             # so only use types_mapper as workaround for older versions
             if not PYARROW_GE_19:
@@ -493,10 +530,35 @@ def read_dataframe(
         else:
             return df
 
-    meta, index, geometry, field_data = result
+    meta, index, geometry, field_data, *rest = result
+    field_masks = rest[0] if rest else None
 
     columns = meta["fields"].tolist()
-    data = {columns[i]: field_data[i] for i in range(len(columns))}
+    if use_nullable_dtypes:
+        from pyogrio._io import NULLABLE_INT_DTYPES
+
+        data = {}
+        for i in range(len(columns)):
+            np_dtype = meta["dtypes"][i]
+            nullable_name = NULLABLE_INT_DTYPES.get(
+                getattr(np_dtype, "name", np_dtype)
+            )
+            if nullable_name is not None and field_masks[i] is not None:
+                # build a pandas masked array: integer/boolean dtype is
+                # preserved and nulls are tracked independently of values,
+                # so a legitimate zero is never treated as missing
+                if nullable_name == "boolean":
+                    data[columns[i]] = pd.arrays.BooleanArray(
+                        field_data[i].astype(np.bool_), field_masks[i]
+                    )
+                else:
+                    data[columns[i]] = pd.arrays.IntegerArray(
+                        field_data[i], field_masks[i]
+                    )
+            else:
+                data[columns[i]] = field_data[i]
+    else:
+        data = {columns[i]: field_data[i] for i in range(len(columns))}
     if fid_as_index:
         index = pd.Index(index, name="fid")
     else:

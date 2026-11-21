@@ -981,6 +981,197 @@ def test_read_data_types_numeric_with_null(test_gpkg_nulls):
             assert field.dtype == "float64"
 
 
+def _write_nullable_dataset(path, ext="gpkg", n=5):
+    """Create a dataset with nulls in int64/int32/int16/bool columns."""
+    # Point(0, 0)
+    geometry = np.array(
+        [bytes.fromhex("010100000000000000000000000000000000000000")] * n,
+        dtype=object,
+    )
+    # include values larger than the exact-integer range of float64, at rows
+    # that are *not* masked, so the precision can be checked on real values
+    big = 2**63 - 111
+    field_data = [
+        np.array([1, 0, big, -5, 3], dtype="int64"),
+        np.array([10, 0, -3, 4, 5], dtype="int32"),
+        np.array([7, 0, 8, 9, 10], dtype="int16"),
+        np.array([True, False, True, False, True]),
+        np.array([1.5, 0.0, 3.5, np.nan, 5.5], dtype="float64"),
+    ]
+    fields = ["i64", "i32", "i16", "b", "f"]
+    field_mask = [
+        np.array([False, False, False, True, False]),
+        np.array([True, False, False, False, True]),
+        np.array([False, False, False, False, False]),
+        np.array([False, True, False, True, False]),
+        None,
+    ]
+    filename = path if str(path).endswith(ext) else path / f"test_nullable.{ext}"
+    write(
+        filename,
+        geometry,
+        field_data,
+        fields,
+        field_mask=field_mask,
+        geometry_type="Point",
+        crs="EPSG:4326",
+    )
+    return filename, field_data, field_mask
+
+
+def test_read_nullable_dtypes_returns_five_tuple(tmp_path):
+    filename, _, _ = _write_nullable_dataset(tmp_path)
+
+    # legacy mode keeps the 4-tuple
+    legacy = read(filename)
+    assert len(legacy) == 4
+
+    # fidelity mode adds the masks as a fifth element
+    result = read(filename, use_nullable_dtypes=True)
+    assert len(result) == 5
+    meta, _, _, field_data, field_masks = result
+    assert len(field_data) == len(field_masks) == 5
+
+
+def test_read_nullable_dtypes_preserves_integer_dtypes_and_nulls(tmp_path):
+    filename, field_data, field_mask = _write_nullable_dataset(tmp_path)
+
+    meta, _, _, fields, masks = read(filename, use_nullable_dtypes=True)
+
+    # original integer / boolean logical dtypes are preserved (no float cast)
+    assert [field.dtype for field in fields[:4]] == [
+        np.dtype("int64"),
+        np.dtype("int32"),
+        np.dtype("int16"),
+        np.dtype("bool"),
+    ]
+
+    # large int64 value is read back exactly (no float64 precision loss);
+    # the big value sits on row 2, which is not a masked row
+    big = 2**63 - 111
+    assert fields[0][2] == big
+
+    # nulls live in the mask, independently of values
+    for j in range(4):
+        assert array_equal(masks[j], field_mask[j])
+
+    # a legitimate zero is never reported as missing
+    assert masks[0][1] is np.bool_(False) and fields[0][1] == 0
+    assert masks[1][1] is np.bool_(False) and fields[1][1] == 0
+    assert masks[3][1] is np.bool_(True)  # bool row 1 is actually null
+
+    # column without any nulls still gets an all-False mask
+    assert masks[2] is not None and not masks[2].any()
+
+    # float columns keep using NaN and do not get a mask
+    assert fields[4].dtype == np.dtype("float64")
+    assert masks[4] is None
+    assert np.isnan(fields[4][3])
+
+
+def test_read_nullable_dtypes_legacy_still_casts_to_float(tmp_path):
+    filename, _, _ = _write_nullable_dataset(tmp_path)
+
+    meta, _, _, fields = read(filename)
+
+    # columns that contain nulls are cast to float64 with NaN (legacy behaviour)
+    assert fields[0].dtype == np.dtype("float64")
+    assert fields[1].dtype == np.dtype("float64")
+    assert fields[3].dtype == np.dtype("float64")
+    assert np.isnan(fields[0][3])  # i64 null is on row 3
+    # null-free int16 column is untouched (dtype depends on read subset)
+    assert fields[2].dtype == np.dtype("int16")
+
+
+@pytest.mark.parametrize("ext", ["gpkg", "fgb"])
+def test_read_nullable_dtypes_roundtrip(tmp_path, ext):
+    filename, field_data, field_mask = _write_nullable_dataset(tmp_path, ext=ext)
+
+    _, _, _, fields, masks = read(filename, use_nullable_dtypes=True)
+
+    out = tmp_path / f"roundtrip.{ext}"
+    write(
+        out,
+        np.array(
+            [bytes.fromhex("010100000000000000000000000000000000000000")] * 5,
+            dtype=object,
+        ),
+        fields,
+        ["i64", "i32", "i16", "b", "f"],
+        field_mask=masks,
+        geometry_type="Point",
+        crs="EPSG:4326",
+    )
+
+    _, _, _, fields2, masks2 = read(out, use_nullable_dtypes=True)
+    for j in range(4):
+        valid = ~masks2[j]
+        # values match itemwise wherever the field is set ...
+        assert array_equal(fields2[j][valid], fields[j][valid])
+        # ... and null positions match itemwise
+        assert array_equal(masks2[j], masks[j])
+
+    # explicit zero survives as a value
+    assert fields2[0][1] == 0 and not masks2[0][1]
+
+
+def test_read_nullable_dtypes_by_fid(tmp_path):
+    filename, _, field_mask = _write_nullable_dataset(tmp_path)
+
+    # GPKG FIDs start at 1; fids 1, 3, 5 correspond to rows 0, 2, 4
+    meta, _, _, fields, masks = read(
+        filename, fids=[1, 3, 5], use_nullable_dtypes=True
+    )
+    assert [field.dtype for field in fields[:4]] == [
+        np.dtype("int64"),
+        np.dtype("int32"),
+        np.dtype("int16"),
+        np.dtype("bool"),
+    ]
+    assert array_equal(masks[0], field_mask[0][[0, 2, 4]])
+    assert array_equal(masks[1], field_mask[1][[0, 2, 4]])
+
+
+def test_read_nullable_dtypes_empty_result(tmp_path):
+    filename, _, _ = _write_nullable_dataset(tmp_path)
+
+    result = read(filename, skip_features=100, use_nullable_dtypes=True)
+    assert len(result) == 5
+    meta, _, _, fields, masks = result
+    assert all(field.shape == (0,) for field in fields)
+    assert all(mask is None or mask.shape == (0,) for mask in masks)
+
+
+def test_read_nullable_dtypes_large_dataset_mask_chunks(tmp_path):
+    # more rows than the maximum internal chunk size (65_536) to exercise
+    # mask chunk concatenation
+    n = 70_000
+    geometry = np.array(
+        [bytes.fromhex("010100000000000000000000000000000000000000")] * n,
+        dtype=object,
+    )
+    values = np.arange(n, dtype="int64")
+    mask = np.zeros(n, dtype=bool)
+    mask[3] = True
+    mask[66_000] = True
+
+    filename = tmp_path / "chunked.gpkg"
+    write(
+        filename,
+        geometry,
+        [values],
+        ["v"],
+        field_mask=[mask],
+        geometry_type="Point",
+        crs="EPSG:4326",
+    )
+
+    _, _, _, fields, masks = read(filename, use_nullable_dtypes=True)
+    assert fields[0].dtype == np.dtype("int64")
+    assert masks[0].sum() == 2
+    assert array_equal(fields[0][~masks[0]], values[~mask])
+
+
 def test_read_datetime_millisecond(datetime_file):
     field = read(datetime_file)[3][0]
     assert field.dtype == "datetime64[ms]"

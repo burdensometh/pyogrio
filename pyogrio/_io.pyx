@@ -126,6 +126,22 @@ DTYPE_OGR_FIELD_TYPES = {
 }
 
 
+# OGR field types whose values are integer numbers (booleans are stored by
+# OGR as OFTInteger with the OFSTBoolean subtype)
+_INTEGER_OGR_TYPES = {OFTInteger, OFTInteger64}
+
+
+# Mapping of the numpy dtype names used while reading integer / boolean
+# fields to the pandas nullable dtype names returned when
+# ``use_nullable_dtypes=True``.
+NULLABLE_INT_DTYPES = {
+    "bool": "boolean",
+    "int16": "Int16",
+    "int32": "Int32",
+    "int64": "Int64",
+}
+
+
 cdef int start_transaction(OGRDataSourceH ogr_dataset, int force) except 1:
     """Start a transaction on the dataset.
 
@@ -1033,14 +1049,21 @@ cdef process_fields(
     int n_fields,
     list field_data,
     list field_data_view,
+    list field_mask,
+    list field_mask_view,
     list field_indexes,
     list field_ogr_types,
     encoding,
-    bint datetime_as_string
+    bint datetime_as_string,
+    bint use_nullable_dtypes
 ):
     """Process the fields of a feature.
 
-    The field data is stored in the field_data_view.
+    The field data is stored in the field_data_view. When
+    ``use_nullable_dtypes`` is True, the null status of integer and boolean
+    fields is recorded in the (boolean) field_mask_view arrays, independently
+    of the actual values, so that the integer dtype does not have to be cast
+    to float64 to hold NaN values.
 
     Parameters
     ----------
@@ -1054,6 +1077,12 @@ cdef process_fields(
         The list of arrays where field data is stored
     field_data_view : object
         A view to the array to save the data to
+    field_mask : object
+        The list of arrays where field null masks are stored, or an empty
+        list when ``use_nullable_dtypes`` is False
+    field_mask_view : object
+        A view to the mask arrays to save the null status to, or an empty
+        list when ``use_nullable_dtypes`` is False
     field_indexes : object
         A list with the indexes to each field in the feature
     field_ogr_types : object
@@ -1062,6 +1091,9 @@ cdef process_fields(
         The encoding to use for reading string field data
     datetime_as_string : bint
         Whether to read datetime fields as strings
+    use_nullable_dtypes : bint
+        Whether to preserve the integer/boolean dtype of fields containing
+        null values by tracking nulls in separate mask arrays
 
     """
     cdef int j
@@ -1090,7 +1122,16 @@ cdef process_fields(
 
         isnull = OGR_F_IsFieldSetAndNotNull(ogr_feature, field_index) == 0
         if isnull:
-            if field_type in (OFTInteger, OFTInteger64, OFTReal):
+            if (
+                use_nullable_dtypes
+                and field_type in _INTEGER_OGR_TYPES
+                and field_mask_view[j] is not None
+            ):
+                # Preserve the original integer/boolean dtype: the null is
+                # recorded only in the mask, the (undefined) data value is
+                # left untouched (it is never read back through the mask).
+                field_mask_view[j][i] = True
+            elif field_type in (OFTInteger, OFTInteger64, OFTReal):
                 # if a boolean or integer type, have to cast to float to hold
                 # NaN values
                 if data.dtype.kind in ("b", "i", "u"):
@@ -1107,6 +1148,14 @@ cdef process_fields(
                 data[i] = None
 
             continue
+
+        if (
+            use_nullable_dtypes
+            and field_type in _INTEGER_OGR_TYPES
+            and field_mask_view[j] is not None
+        ):
+            # an explicitly set value is never null, even when it equals zero
+            field_mask_view[j][i] = False
 
         if field_type == OFTInteger:
             data[i] = OGR_F_GetFieldAsInteger(ogr_feature, field_index)
@@ -1233,7 +1282,8 @@ cdef get_features(
     int skip_features,
     int num_features,
     uint8_t return_fids,
-    bint datetime_as_string
+    bint datetime_as_string,
+    bint use_nullable_dtypes=False
 ):
     """Get features from a layer.
 
@@ -1257,12 +1307,16 @@ cdef get_features(
         Whether to return feature IDs
     datetime_as_string : bint
         Whether to read datetime fields as strings
+    use_nullable_dtypes : bint, default False
+        Whether to track null values of integer/boolean fields in separate
+        boolean mask arrays instead of casting the data to float64
 
     Returns
     -------
-    tuple(ndarray, ndarray, ndarray)
-        A tuple containing arrays with the feature IDs, geometries, and field data read
-        from the layer.
+    tuple(ndarray, ndarray, ndarray, ndarray)
+        A tuple containing arrays with the feature IDs, geometries, field data
+        and field null masks read from the layer. When ``use_nullable_dtypes``
+        is False, the field masks are None.
 
     """
     cdef OGRFeatureH ogr_feature = NULL
@@ -1289,6 +1343,16 @@ cdef get_features(
     geom_chunks = []
     n_fields = fields.shape[0]
     field_data_chunks: list[list[np.ndarray]] = []
+    field_mask_chunks: list[list[np.ndarray]] = []
+
+    # Precompute which fields need a null mask. This is computed outside the
+    # `add_data_chunk` closure below so that the closure does not capture the
+    # (optional) function argument, which would otherwise be shadowed inside
+    # the Cython scope struct.
+    field_needs_mask = [
+        use_nullable_dtypes and fields[field_index, 1] in _INTEGER_OGR_TYPES
+        for field_index in range(n_fields)
+    ]
 
     def add_data_chunk(size):
         """Add a new data chunk to the output array lists."""
@@ -1298,6 +1362,7 @@ cdef get_features(
             geom_chunks.append(np.empty(shape=(size, ), dtype="object"))
 
         field_data_chunk: list[np.ndarray] = []
+        field_mask_chunk: list[np.ndarray] = []
         for field_index in range(n_fields):
             if datetime_as_string and fields[field_index, 3].startswith("datetime"):
                 dtype = "object"
@@ -1306,9 +1371,22 @@ cdef get_features(
             else:
                 dtype = fields[field_index, 3]
 
-            field_data_chunk.append(np.empty(shape=(size, ), dtype=dtype))
+            if field_needs_mask[field_index]:
+                # zero-initialize integer/boolean data so that positions later
+                # marked as null never hold uninitialized memory; the mask, not
+                # the value, decides whether a record is missing
+                field_data_chunk.append(np.zeros(shape=(size, ), dtype=dtype))
+                # integer/boolean field: track nulls independently of values
+                field_mask_chunk.append(
+                    np.zeros(shape=(size, ), dtype=bool)
+                )
+            else:
+                field_data_chunk.append(np.empty(shape=(size, ), dtype=dtype))
+                # other field types keep using None / NaN / NaT in the data
+                field_mask_chunk.append(None)
 
         field_data_chunks.append(field_data_chunk)
+        field_mask_chunks.append(field_mask_chunk)
 
     i = 0
     i_total = 0
@@ -1364,6 +1442,18 @@ cdef get_features(
                     field_data_chunks[last_chunk_index][field_index][:]
                     for field_index in range(n_fields)
                 ]
+                if use_nullable_dtypes:
+                    field_mask_view = [
+                        (
+                            field_mask_chunks[last_chunk_index][field_index][:]
+                            if field_mask_chunks[last_chunk_index][field_index]
+                            is not None
+                            else None
+                        )
+                        for field_index in range(n_fields)
+                    ]
+                else:
+                    field_mask_view = [None] * n_fields
 
             if return_fids:
                 fid_view[i] = OGR_F_GetFID(ogr_feature)
@@ -1373,8 +1463,9 @@ cdef get_features(
 
             process_fields(
                 ogr_feature, i, n_fields, field_data_chunks[last_chunk_index],
-                field_data_view, field_indexes, field_ogr_types, encoding,
-                datetime_as_string
+                field_data_view, field_mask_chunks[last_chunk_index],
+                field_mask_view, field_indexes, field_ogr_types, encoding,
+                datetime_as_string, use_nullable_dtypes
             )
 
             i += 1
@@ -1401,13 +1492,37 @@ cdef get_features(
             field_data_chunks[last_chunk_index][field_index] = (
                 field_data_chunks[last_chunk_index][field_index][:i]
             )
+            if (
+                use_nullable_dtypes
+                and field_mask_chunks[last_chunk_index][field_index] is not None
+            ):
+                field_mask_chunks[last_chunk_index][field_index] = (
+                    field_mask_chunks[last_chunk_index][field_index][:i]
+                )
+
+    if not use_nullable_dtypes:
+        field_masks = None
+    elif last_chunk_index == 0:
+        field_masks = field_mask_chunks[0]
+    else:
+        field_masks = []
+        for field_index in range(n_fields):
+            mask_to_concat = [
+                field_mask_chunks[chunk][field_index]
+                for chunk in range(last_chunk_index + 1)
+            ]
+            if any(mask is None for mask in mask_to_concat):
+                # this field type does not use a mask
+                field_masks.append(None)
+            else:
+                field_masks.append(np.concatenate(mask_to_concat))
 
     if last_chunk_index == 0:
         # Only one chunk, so avoid concatenation
         fid_data = fid_chunks[0] if return_fids else None
         geom_data = geom_chunks[0] if read_geometry else None
 
-        return fid_data, geom_data, field_data_chunks[0]
+        return fid_data, geom_data, field_data_chunks[0], field_masks
 
     else:
         # Concatenate all chunks
@@ -1421,7 +1536,7 @@ cdef get_features(
                 data_to_concat.append(field_data_chunks[chunk][field_index])
             field_data.append(np.concatenate(data_to_concat))
 
-        return fid_data, geom_data, field_data
+        return fid_data, geom_data, field_data, field_masks
 
 
 @cython.boundscheck(False)  # Deactivate bounds checking
@@ -1433,7 +1548,8 @@ cdef get_features_by_fid(
     encoding,
     uint8_t read_geometry,
     uint8_t force_2d,
-    bint datetime_as_string
+    bint datetime_as_string,
+    bint use_nullable_dtypes=False
 ):
     """Get features by their feature IDs (FIDs).
 
@@ -1453,12 +1569,16 @@ cdef get_features_by_fid(
         Whether to force 2D geometries
     datetime_as_string : bint
         Whether to read datetime fields as strings
+    use_nullable_dtypes : bint, default False
+        Whether to track null values of integer/boolean fields in separate
+        boolean mask arrays instead of casting the data to float64
 
     Returns
     -------
-    tuple(ndarray, ndarray)
-        A tuple containing arrays with the geometries and field data read from the
-        layer.
+    tuple(ndarray, ndarray, ndarray)
+        A tuple containing arrays with the geometries, field data and field
+        null masks read from the layer. When ``use_nullable_dtypes`` is False,
+        the field masks are None.
 
     """
     cdef OGRFeatureH ogr_feature = NULL
@@ -1482,16 +1602,37 @@ cdef get_features_by_fid(
     n_fields = fields.shape[0]
     field_indexes = list(fields[:, 0])
     field_ogr_types = list(fields[:, 1])
-    field_data = [
-        np.empty(
-            shape=(count, ),
-            dtype=(
-                "object"
-                if datetime_as_string and fields[field_index, 3].startswith("datetime")
-                else fields[field_index, 3]
-            )
-        ) for field_index in range(n_fields)
-    ]
+    field_data = []
+    field_masks = []
+    for field_index in range(n_fields):
+        if datetime_as_string and fields[field_index, 3].startswith("datetime"):
+            dtype = "object"
+        elif fields[field_index, 3].startswith("list"):
+            dtype = "object"
+        else:
+            dtype = fields[field_index, 3]
+
+        if (
+            use_nullable_dtypes
+            and fields[field_index, 1] in _INTEGER_OGR_TYPES
+        ):
+            # zero-initialize: null positions are decided by the mask, and the
+            # underlying values must never hold uninitialized memory
+            field_data.append(np.zeros(shape=(count, ), dtype=dtype))
+            field_masks.append(np.zeros(shape=(count, ), dtype=bool))
+        else:
+            field_data.append(np.empty(shape=(count, ), dtype=dtype))
+            field_masks.append(None)
+
+    if not use_nullable_dtypes:
+        field_masks = None
+        field_mask_view = [None] * n_fields
+    else:
+        field_mask_view = [
+            (field_masks[field_index][:] if field_masks[field_index] is not None
+             else None)
+            for field_index in range(n_fields)
+        ]
 
     field_data_view = [field_data[field_index][:] for field_index in range(n_fields)]
 
@@ -1515,14 +1656,17 @@ cdef get_features_by_fid(
 
             process_fields(
                 ogr_feature, i, n_fields, field_data, field_data_view,
-                field_indexes, field_ogr_types, encoding, datetime_as_string
+                field_masks if field_masks is not None else [None] * n_fields,
+                field_mask_view,
+                field_indexes, field_ogr_types, encoding, datetime_as_string,
+                use_nullable_dtypes
             )
         finally:
             if ogr_feature != NULL:
                 OGR_F_Destroy(ogr_feature)
                 ogr_feature = NULL
 
-    return (geometries, field_data)
+    return (geometries, field_data, field_masks)
 
 
 @cython.boundscheck(False)  # Deactivate bounds checking
@@ -1636,14 +1780,17 @@ def ogr_read(
     str sql_dialect=None,
     int return_fids=False,
     bint datetime_as_string=False,
+    bint use_nullable_dtypes=False,
 ):
     """Read features from a dataset.
 
     Returns
     -------
-    tuple(dict, ndarray, ndarray, ndarray)
+    tuple(dict, ndarray, ndarray, ndarray, ndarray)
         A tuple containing a dictionary with metadata, an array with feature IDs,
-        an array with geometries and an array with field data read from the dataset.
+        an array with geometries, an array with field data read from the dataset
+        and an array with boolean null masks for integer/boolean fields (only
+        populated when ``use_nullable_dtypes`` is True, otherwise None).
 
     """
     cdef bint use_tmp_vsimem = isinstance(path_or_buffer, bytes)
@@ -1654,6 +1801,9 @@ def ogr_read(
     cdef OGRLayerH ogr_layer = NULL
     cdef const char *prev_shape_encoding = NULL
     cdef bint override_shape_encoding = False
+
+    # ensure the name is always bound, also when exiting through `finally`
+    field_masks = None
 
     if fids is not None:
         if (
@@ -1765,7 +1915,7 @@ def ogr_read(
         geometry_type = get_geometry_type(ogr_layer)
 
         if fids is not None:
-            geometries, field_data = get_features_by_fid(
+            geometries, field_data, field_masks = get_features_by_fid(
                 ogr_layer,
                 fids,
                 fields,
@@ -1773,6 +1923,7 @@ def ogr_read(
                 read_geometry=read_geometry and geometry_type is not None,
                 force_2d=force_2d,
                 datetime_as_string=datetime_as_string,
+                use_nullable_dtypes=use_nullable_dtypes,
             )
 
             # bypass reading fids since these should match fids used for read
@@ -1817,7 +1968,7 @@ def ogr_read(
             ):
                 num_features = get_feature_count(ogr_layer, 0)
 
-            fid_data, geometries, field_data = get_features(
+            fid_data, geometries, field_data, field_masks = get_features(
                 ogr_layer,
                 fields,
                 encoding,
@@ -1826,7 +1977,8 @@ def ogr_read(
                 skip_features=skip_features,
                 num_features=num_features,
                 return_fids=return_fids,
-                datetime_as_string=datetime_as_string
+                datetime_as_string=datetime_as_string,
+                use_nullable_dtypes=use_nullable_dtypes,
             )
 
         ogr_types = [FIELD_TYPE_NAMES.get(field[1], "Unknown") for field in fields]
@@ -1843,7 +1995,6 @@ def ogr_read(
             "ogr_subtypes": ogr_subtypes,
             "geometry_type": geometry_type,
         }
-
     finally:
         if dataset_options != NULL:
             CSLDestroy(dataset_options)
@@ -1871,7 +2022,8 @@ def ogr_read(
         meta,
         fid_data,
         geometries,
-        field_data
+        field_data,
+        field_masks if use_nullable_dtypes else None,
     )
 
 

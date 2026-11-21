@@ -40,6 +40,7 @@ from pyogrio.geopandas import PANDAS_GE_20, read_dataframe, write_dataframe
 from pyogrio.raw import (
     DRIVERS_NO_MIXED_DIMENSIONS,
     DRIVERS_NO_MIXED_SINGLE_MULTI,
+    read_arrow,
 )
 from pyogrio.tests.conftest import (
     ALL_EXTS,
@@ -3139,6 +3140,87 @@ def test_write_nullable_dtypes(tmp_path, use_arrow):
     expected["col5"] = expected["col5"].astype("str")
     expected.loc[1, "col5"] = None  # pandas converts to pd.NA on line above
     assert_geodataframe_equal(output_gdf, expected)
+
+
+def _nullable_test_data():
+    return {
+        "i64": pd.Series([1, 0, None, -5, 3], dtype="Int64"),
+        "i32": pd.Series([None, 0, -3, 4, None], dtype="Int32"),
+        "i16": pd.Series([7, 0, 8, 9, 10], dtype="Int16"),
+        "b": pd.Series([True, None, True, None, True], dtype="boolean"),
+        "f": pd.Series([1.5, 0.0, 3.5, np.nan, 5.5], dtype="float64"),
+    }
+
+
+def test_read_dataframe_nullable_dtypes(tmp_path):
+    path = tmp_path / "test_read_nullable.gpkg"
+    gdf = gp.GeoDataFrame(
+        _nullable_test_data(),
+        geometry=[shapely.Point(0, 0)] * 5,
+        crs="EPSG:4326",
+    )
+    write_dataframe(gdf, path)
+
+    result = read_dataframe(path, use_nullable_dtypes=True, use_arrow=False)
+    assert str(result["i64"].dtype) == "Int64"
+    assert str(result["i32"].dtype) == "Int32"
+    assert str(result["i16"].dtype) == "Int16"
+    assert str(result["b"].dtype) == "boolean"
+    assert result["f"].dtype == np.dtype("float64")
+
+    # nulls and values (including explicit zeros) round-trip exactly
+    for col in ["i64", "i32", "i16", "b"]:
+        assert result[col].equals(gdf[col]), col
+    assert result["i64"].iloc[1] == 0
+    assert pd.isna(result["i64"].iloc[2])
+
+    # default behaviour remains the legacy float64 cast
+    legacy = read_dataframe(path, use_arrow=False)
+    assert legacy["i64"].dtype == np.dtype("float64")
+    assert np.isnan(legacy["i64"].iloc[2])
+
+
+def test_read_dataframe_nullable_dtypes_roundtrip(tmp_path):
+    path = tmp_path / "test_nullable_roundtrip.gpkg"
+    gdf = gp.GeoDataFrame(
+        _nullable_test_data(),
+        geometry=[shapely.Point(0, 0)] * 5,
+        crs="EPSG:4326",
+    )
+    write_dataframe(gdf, path, use_arrow=False)
+
+    back = read_dataframe(path, use_nullable_dtypes=True, use_arrow=False)
+    for col in ["i64", "i32", "i16", "b"]:
+        assert back[col].equals(gdf[col]), col
+
+
+@requires_pyarrow_api
+def test_read_dataframe_nullable_dtypes_arrow(tmp_path):
+    path = tmp_path / "test_nullable_arrow.gpkg"
+    # GDAL < 3.8.3 cannot read boolean columns through the Arrow API, so this
+    # exercises the integer columns only
+    gdf = gp.GeoDataFrame(
+        {
+            "i64": pd.Series([1, 0, None, -5, 3], dtype="Int64"),
+            "i32": pd.Series([None, 0, -3, 4, None], dtype="Int32"),
+        },
+        geometry=[shapely.Point(0, 0)] * 5,
+        crs="EPSG:4326",
+    )
+    write_dataframe(gdf, path)
+
+    result = read_dataframe(path, use_nullable_dtypes=True, use_arrow=True)
+    assert str(result["i64"].dtype) == "Int64"
+    assert str(result["i32"].dtype) == "Int32"
+    assert pd.isna(result["i64"].iloc[2])
+    assert result["i64"].iloc[1] == 0
+    assert result["i64"].equals(gdf["i64"])
+    assert result["i32"].equals(gdf["i32"])
+
+    # the Arrow table itself always preserves the integer logical type + nulls
+    meta, table = read_arrow(path)
+    assert str(table.schema.field("i64").type) == "int64"
+    assert table.to_pydict()["i64"] == [1, 0, None, -5, 3]
 
 
 @pytest.mark.parametrize(
