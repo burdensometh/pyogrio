@@ -1,8 +1,11 @@
 """Low level functions to read and write OGR data sources."""
 
+import contextlib
 import warnings
 from io import BytesIO
 from pathlib import Path
+
+import numpy as np
 
 from pyogrio._compat import HAS_ARROW_WRITE_API, HAS_PYARROW
 from pyogrio._env import GDALEnv
@@ -35,6 +38,220 @@ DRIVERS_NO_MIXED_DIMENSIONS = {
     "FlatGeobuf",
 }
 
+# Maximum number of FIDs that can be requested in a single aligned read. This limits
+# the size of the request (and the corresponding result) to something that fits in
+# memory and keeps the number of queries needed for large requests bounded.
+_MAX_FIDS_ALIGNED = 100_000
+
+# Maximum number of FIDs used in a single filter expression. Drivers that use the
+# default "OGRSQL" dialect (e.g. Shapefile, FlatGeobuf, GeoJSON) only support up to
+# 4997 values in an "IN" clause, so larger aligned requests are split in chunks.
+_FIDS_FILTER_CHUNK_SIZE = 4_997
+
+
+def _as_int64_fids(fids):
+    """Convert an array-like of FIDs to an int64 numpy array, preserving precision.
+
+    Only exact integers are accepted; values that cannot be represented by an int64
+    raise a ``ValueError``.
+    """
+    arr = np.asarray(fids)
+
+    if arr.ndim != 1:
+        raise ValueError("'fids' must be one-dimensional")
+
+    if arr.dtype.kind == "b":
+        raise ValueError("'fids' must contain integer values")
+
+    if arr.dtype.kind == "f":
+        if not np.all(np.isfinite(arr)) or np.any(arr != np.floor(arr)):
+            raise ValueError("'fids' must contain integer values")
+
+    elif arr.dtype.kind not in ("i", "u"):
+        try:
+            arr = np.array([int(value) for value in arr], dtype=np.int64)
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("'fids' must contain integer values") from None
+
+        return arr
+
+    if arr.dtype.kind == "u" and arr.size and arr.max() > np.iinfo(np.int64).max:
+        raise ValueError("'fids' contains values that do not fit in an int64")
+
+    return arr.astype(np.int64, copy=False)
+
+
+def _validate_fids_aligned(
+    fids,
+    fids_aligned,
+    skip_features=0,
+    max_features=None,
+    where=None,
+    bbox=None,
+    mask=None,
+    sql=None,
+):
+    """Validate and normalize the FIDs for an aligned read.
+
+    Returns the normalized int64 array, or None if aligned mode is not requested.
+    """
+    if not fids_aligned:
+        return None
+
+    if fids is None:
+        raise ValueError("'fids' must be provided when 'fids_aligned=True'")
+
+    if (
+        where is not None
+        or bbox is not None
+        or mask is not None
+        or sql is not None
+        or skip_features
+        or max_features
+    ):
+        raise ValueError(
+            "cannot set both 'fids' (with 'fids_aligned=True') and any of 'where', "
+            "'bbox', 'mask', 'sql', 'skip_features' or 'max_features'"
+        )
+
+    fids = _as_int64_fids(fids)
+
+    if fids.size > _MAX_FIDS_ALIGNED:
+        raise ValueError(
+            f"the number of 'fids' is limited to {_MAX_FIDS_ALIGNED} when "
+            f"'fids_aligned=True'; got {fids.size} fids"
+        )
+
+    return fids
+
+
+def _iter_fid_chunks(fids):
+    """Split an int64 array of FIDs in chunks that fit in a single filter."""
+    for start in range(0, len(fids), _FIDS_FILTER_CHUNK_SIZE):
+        yield fids[start : start + _FIDS_FILTER_CHUNK_SIZE]
+
+
+def _get_fid_column_position(schema_names, fid_column):
+    """Get the position of the FID column in an Arrow schema.
+
+    GDAL returns the FID column as the first column. When its name is the same as
+    the name of an attribute column, both columns are present in the schema; the
+    first one is the FID column.
+    """
+    positions = [i for i, name in enumerate(schema_names) if name == fid_column]
+    if not positions:
+        raise DataSourceError(
+            f"could not find the FID column '{fid_column}' in the Arrow result"
+        )
+
+    return positions[0]
+
+
+def _align_arrow_table(table, meta, fids, drop_fid_column):
+    """Reorder an Arrow table so that row ``i`` corresponds to ``fids[i]``.
+
+    The table is expected to contain the FID column of the data source. Rows are
+    selected by FID (duplicate FIDs are selected once per occurrence) and FIDs that
+    are not present in the data source are returned as a row with null values. The
+    FID column is set to the requested FIDs, so the returned values are exactly the
+    values that were requested (as int64, preserving the integer precision).
+    """
+    import pyarrow as pa
+    import pyarrow.compute as pc
+
+    fid_index = _get_fid_column_position(table.schema.names, meta["fid_column"])
+
+    fid_values = table.column(fid_index)
+    if not pa.types.is_integer(fid_values.type):
+        raise DataSourceError(
+            f"the FID column '{meta['fid_column']}' is not an integer column"
+        )
+
+    if fid_values.type != pa.int64():
+        fid_values = fid_values.cast(pa.int64())
+
+    requested = pa.array(fids, type=pa.int64())
+
+    # Positions of the requested FIDs in the table; null for missing FIDs
+    positions = pc.index_in(requested, value_set=fid_values)
+
+    aligned = table.take(positions)
+
+    # Put the requested FIDs in the FID column: this restores the exact requested
+    # values (also for rows that were duplicated in the request) and replaces the
+    # null placeholder for missing FIDs.
+    aligned = aligned.set_column(fid_index, table.schema.field(fid_index), requested)
+
+    if drop_fid_column:
+        aligned = aligned.remove_column(fid_index)
+
+    return aligned
+
+
+@contextlib.contextmanager
+def _aligned_arrow_source(
+    path_or_buffer,
+    aligned_fids,
+    open_kwargs,
+    drop_fid_column,
+    use_pyarrow,
+):
+    """Open one or more Arrow sources and align the rows with ``aligned_fids``.
+
+    Requests larger than the maximum size of a single filter expression are split in
+    chunks that are queried one after the other; the results are combined before the
+    rows are aligned. Alignment requires knowing all rows up front, so the stream is
+    materialized before it is returned.
+    """
+    import pyarrow as pa
+
+    tables = []
+    meta = None
+    for chunk in _iter_fid_chunks(aligned_fids):
+        with ogr_open_arrow(
+            path_or_buffer,
+            **{
+                **open_kwargs,
+                "fids": chunk,
+                "fids_aligned": True,
+                # each chunk is filtered on its own FIDs; the FID column is needed to
+                # align the combined result and is dropped afterwards if not requested
+                "return_fids": True,
+            },
+        ) as (chunk_meta, reader):
+            meta = chunk_meta
+            tables.append(reader.read_all())
+
+    if not tables:
+        # no FIDs were requested: still open the source once (with an empty selection)
+        # to obtain the schema of an empty result
+        with ogr_open_arrow(
+            path_or_buffer,
+            **{
+                **open_kwargs,
+                "fids": aligned_fids,
+                "fids_aligned": True,
+                "return_fids": True,
+            },
+        ) as (meta, reader):
+            table = reader.read_all()
+    elif len(tables) == 1:
+        table = tables[0]
+    else:
+        table = pa.concat_tables(tables)
+
+    table = _align_arrow_table(
+        table, meta, aligned_fids, drop_fid_column=drop_fid_column
+    )
+
+    if use_pyarrow:
+        reader = pa.RecordBatchReader.from_batches(table.schema, table.to_batches())
+    else:
+        # a pyarrow Table implements the Arrow PyCapsule Protocol
+        reader = table
+
+    yield meta, reader
+
 
 def read(
     path_or_buffer,
@@ -54,6 +271,7 @@ def read(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    fids_aligned=False,
     **kwargs,
 ):
     """Read OGR data source into numpy arrays.
@@ -124,7 +342,8 @@ def read(
         starting index is driver and file specific (e.g. typically 0 for
         Shapefile and 1 for GeoPackage, but can still depend on the specific
         file). The performance of reading a large number of features usings FIDs
-        is also driver specific.
+        is also driver specific. Use ``fids_aligned=True`` to return the rows in the
+        order of ``fids`` instead (see below).
     sql : str, optional (default: None)
         The SQL statement to execute. Look at the sql_dialect parameter for more
         information on the syntax to use for the query. When combined with other
@@ -153,6 +372,25 @@ def read(
         If True, will return datetime dtypes as detected by GDAL as a string
         array (which can be used to extract time zone info), instead of
         a datetime64 array.
+    fids_aligned : bool, optional (default: False)
+        If True, the rows that are returned are aligned with ``fids``: row ``i``
+        corresponds to ``fids[i]``. This is an opt-in alternative to the default
+        selection rules, which are unchanged. When enabled:
+
+        - ``fids`` must be provided, and is limited to 100 000 values;
+        - the order of the rows follows the order of ``fids`` (instead of the
+          order in the data source), also when ``use_arrow`` is used;
+        - duplicate FIDs are returned once per occurrence;
+        - FIDs that do not exist in the data source are not skipped and do not
+          raise an error: a row with missing values (``None`` geometries and
+          missing field values) is returned in their place, so a missing FID
+          never truncates the rest of the requested FIDs;
+        - the FIDs are returned (if ``return_fids=True``) exactly as requested,
+          as int64 values, preserving the full integer precision.
+
+        This can only be combined with the other selection keywords in the same way
+        as ``fids`` itself, i.e. not with ``skip_features``, ``max_features``,
+        ``where``, ``bbox``, ``mask`` or ``sql``.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR.  Invalid
@@ -197,6 +435,19 @@ def read(
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
 
+    aligned_fids = _validate_fids_aligned(
+        fids,
+        fids_aligned,
+        skip_features=skip_features,
+        max_features=max_features,
+        where=where,
+        bbox=bbox,
+        mask=mask,
+        sql=sql,
+    )
+    if aligned_fids is not None:
+        fids = aligned_fids
+
     return ogr_read(
         get_vsi_path_or_buffer(path_or_buffer),
         layer=layer,
@@ -215,6 +466,7 @@ def read(
         return_fids=return_fids,
         dataset_kwargs=dataset_kwargs,
         datetime_as_string=datetime_as_string,
+        fids_aligned=fids_aligned,
     )
 
 
@@ -236,6 +488,7 @@ def read_arrow(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    fids_aligned=False,
     **kwargs,
 ):
     """Read OGR data source into a pyarrow Table.
@@ -278,6 +531,19 @@ def read_arrow(
     if max_features is not None and max_features < 0:
         raise ValueError("'max_features' must be >= 0")
 
+    aligned_fids = _validate_fids_aligned(
+        fids,
+        fids_aligned,
+        skip_features=skip_features,
+        max_features=max_features,
+        where=where,
+        bbox=bbox,
+        mask=mask,
+        sql=sql,
+    )
+    if aligned_fids is not None:
+        fids = aligned_fids
+
     # limit batch size to max_features if set
     if "batch_size" in kwargs:
         batch_size = kwargs.pop("batch_size")
@@ -311,11 +577,17 @@ def read_arrow(
         batch_size=batch_size,
         use_pyarrow=True,
         datetime_as_string=datetime_as_string,
+        fids_aligned=fids_aligned,
         **kwargs,
     ) as source:
         meta, reader = source
 
-        if max_features is not None:
+        if aligned_fids is not None:
+            # open_arrow has already aligned and materialized the table (and dropped
+            # the FID column if it was not requested)
+            table = reader.read_all()
+
+        elif max_features is not None:
             batches = []
             count = 0
             while True:
@@ -367,6 +639,7 @@ def open_arrow(
     batch_size=65_536,
     use_pyarrow=False,
     datetime_as_string=False,
+    fids_aligned=False,
     **kwargs,
 ):
     """Open OGR data source as a stream of Arrow record batches.
@@ -398,6 +671,11 @@ def open_arrow(
     datetime_as_string : bool, optional (default: False)
         If True, will return datetime dtypes as detected by GDAL as strings,
         as Arrow doesn't support e.g. mixed time zones.
+    fids_aligned : bool, optional (default: False)
+        If True, the rows in the stream are aligned with ``fids``, using the same
+        mapping as `read_arrow` and `read` (see the ``fids_aligned`` parameter of
+        `read`). Because alignment requires all rows before any row can be
+        returned, the stream is fully read and buffered inside the context manager.
 
     Examples
     --------
@@ -446,6 +724,52 @@ def open_arrow(
 
     """
     dataset_kwargs = _preprocess_options_key_value(kwargs) if kwargs else {}
+
+    aligned_fids = _validate_fids_aligned(
+        fids,
+        fids_aligned,
+        skip_features=skip_features,
+        max_features=max_features,
+        where=where,
+        bbox=bbox,
+        mask=mask,
+        sql=sql,
+    )
+
+    if aligned_fids is not None:
+        if not HAS_PYARROW:
+            raise RuntimeError(
+                "pyarrow is required to use 'fids_aligned=True' with 'open_arrow'. "
+                "You can use 'read_arrow' instead."
+            )
+
+        return _aligned_arrow_source(
+            get_vsi_path_or_buffer(path_or_buffer),
+            aligned_fids,
+            {
+                "layer": layer,
+                "encoding": encoding,
+                "columns": columns,
+                "read_geometry": read_geometry,
+                "force_2d": force_2d,
+                "skip_features": skip_features,
+                "max_features": max_features or 0,
+                "where": where,
+                "bbox": bbox,
+                "mask": _mask_to_wkb(mask),
+                "sql": sql,
+                "sql_dialect": sql_dialect,
+                # alignment needs the FID column; it is dropped from the output if
+                # it was not requested
+                "return_fids": True,
+                "dataset_kwargs": dataset_kwargs,
+                "batch_size": batch_size,
+                "use_pyarrow": True,
+                "datetime_as_string": datetime_as_string,
+            },
+            drop_fid_column=not return_fids,
+            use_pyarrow=use_pyarrow,
+        )
 
     return ogr_open_arrow(
         get_vsi_path_or_buffer(path_or_buffer),

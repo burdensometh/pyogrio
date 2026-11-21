@@ -40,6 +40,9 @@ from pyogrio.geopandas import PANDAS_GE_20, read_dataframe, write_dataframe
 from pyogrio.raw import (
     DRIVERS_NO_MIXED_DIMENSIONS,
     DRIVERS_NO_MIXED_SINGLE_MULTI,
+    open_arrow,
+    read,
+    read_arrow,
 )
 from pyogrio.tests.conftest import (
     ALL_EXTS,
@@ -1573,6 +1576,127 @@ def test_read_fids(naturalearth_lowres_all_ext, fids, use_arrow):
     )
     assert len(df) == 3
     assert np.array_equal(fids, df.index.values)
+
+
+@pytest.mark.parametrize(
+    "fids",
+    [
+        [10, 5, 1],
+        np.array([10, 5, 1], dtype=np.int64),
+        [10, 5, 10, 5],
+    ],
+)
+def test_read_fids_aligned(naturalearth_lowres_all_ext, fids, use_arrow):
+    expected = read_dataframe(naturalearth_lowres_all_ext, fid_as_index=True)
+
+    df = read_dataframe(
+        naturalearth_lowres_all_ext,
+        fids=fids,
+        fids_aligned=True,
+        fid_as_index=True,
+        use_arrow=use_arrow,
+    )
+
+    assert len(df) == len(fids)
+    assert np.array_equal(fids, df.index.values)
+    assert df.index.dtype == "int64"
+    # the rows (including duplicates) correspond to the requested FIDs
+    expected_subset = expected.loc[fids]
+    assert_geodataframe_equal(df, expected_subset)
+
+
+def test_read_fids_aligned_missing(naturalearth_lowres_all_ext, use_arrow):
+    start = START_FID[naturalearth_lowres_all_ext.suffix]
+    missing = start + 999
+    fids = [start + 1, missing, start]
+
+    df = read_dataframe(
+        naturalearth_lowres_all_ext,
+        fids=fids,
+        fids_aligned=True,
+        fid_as_index=True,
+        use_arrow=use_arrow,
+    )
+
+    expected = read_dataframe(naturalearth_lowres_all_ext, fid_as_index=True)
+
+    assert len(df) == 3
+    assert np.array_equal(fids, df.index.values)
+    # the missing FID is kept in place (does not truncate the rest of the request)
+    assert df.geometry.iloc[1] is None
+    assert df.iloc[0].equals(expected.loc[start + 1])
+    assert df.iloc[2].equals(expected.loc[start])
+
+
+def test_read_fids_aligned_missing_all(naturalearth_lowres, use_arrow):
+    df = read_dataframe(
+        naturalearth_lowres,
+        fids=[999, 1000],
+        fids_aligned=True,
+        fid_as_index=True,
+        use_arrow=use_arrow,
+    )
+    assert len(df) == 2
+    assert np.array_equal(df.index.values, np.array([999, 1000]))
+    assert df.geometry.isna().all()
+
+
+def test_read_fids_aligned_same_name_fid_column(tmp_path, use_arrow):
+    # a GeoJSON property named "OGC_FID" has the same name as the FID column
+    gdf = gp.GeoDataFrame(
+        {"OGC_FID": [100, 200, 300]},
+        geometry=[Point(i, i) for i in range(3)],
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "same_name.geojson"
+    write_dataframe(gdf, path)
+
+    df = read_dataframe(
+        path, fids=[2, 0], fids_aligned=True, fid_as_index=True, use_arrow=use_arrow
+    )
+    assert np.array_equal(df.index.values, np.array([2, 0]))
+    # the attribute column is preserved alongside the index
+    assert list(df["OGC_FID"]) == [300, 100]
+
+    df = read_dataframe(path, fids=[2, 0], fids_aligned=True, use_arrow=use_arrow)
+    assert list(df["OGC_FID"]) == [300, 100]
+
+
+@requires_pyarrow_api
+def test_read_fids_aligned_arrow_order(naturalearth_lowres):
+    # a reversed request is returned in the requested order, also for Arrow
+    expected_fids = read(naturalearth_lowres, return_fids=True)[1]
+    fids = expected_fids[::-1]
+
+    _, table = read_arrow(
+        naturalearth_lowres, fids=fids, fids_aligned=True, return_fids=True
+    )
+    assert np.array_equal(table.column(0).to_pylist(), fids.tolist())
+
+    # a missing FID is returned as a row with null values in the middle
+    fids_with_missing = fids.copy()
+    fids_with_missing[10] = 999_999
+    _, table = read_arrow(
+        naturalearth_lowres,
+        fids=fids_with_missing,
+        fids_aligned=True,
+        return_fids=True,
+    )
+    assert np.array_equal(table.column(0).to_pylist(), fids_with_missing.tolist())
+    assert table.column(1)[10].as_py() is None
+
+
+@requires_pyarrow_api
+def test_open_arrow_fids_aligned(naturalearth_lowres):
+    import pyarrow as pa
+
+    fids = [5, 999, 1]
+    with open_arrow(
+        naturalearth_lowres, fids=fids, fids_aligned=True, return_fids=True
+    ) as (meta, stream):
+        table = pa.table(stream)
+
+    assert np.array_equal(table.column(meta["fid_column"]).to_pylist(), fids)
 
 
 @requires_pyarrow_api

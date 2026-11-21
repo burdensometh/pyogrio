@@ -21,6 +21,7 @@ from pyogrio.errors import DataSourceError
 from pyogrio.raw import (
     DRIVERS_NO_MIXED_DIMENSIONS,
     DRIVERS_NO_MIXED_SINGLE_MULTI,
+    _get_fid_column_position,
     _get_write_path_driver,
     read,
     read_arrow,
@@ -157,6 +158,7 @@ def read_dataframe(
     arrow_to_pandas_kwargs=None,
     datetime_as_string=False,
     mixed_offsets_as_utc=True,
+    fids_aligned=False,
     **kwargs,
 ):
     """Read from an OGR data source to a GeoPandas GeoDataFrame or Pandas DataFrame.
@@ -238,7 +240,8 @@ def read_dataframe(
         ``fid_as_index=True`` to have the index of the GeoDataFrame returned set to the
         FIDs of the features read. If ``use_arrow=True``, the number of FIDs is limited
         to 4997 for drivers with 'OGRSQL' as default SQL dialect. To read a larger
-        number of FIDs, set ``user_arrow=False``.
+        number of FIDs, set ``use_arrow=False``. Use ``fids_aligned=True`` to
+        return the rows in the order of ``fids`` instead (see below).
     sql : str, optional (default: None)
         The SQL statement to execute. Look at the sql_dialect parameter for more
         information on the syntax to use for the query. When combined with other
@@ -313,6 +316,24 @@ def read_dataframe(
           option, but you lose the functionality of a datetime64 column.
 
         If ``datetime_as_string`` is True, this option is ignored.
+    fids_aligned : bool, optional (default: False)
+        If True, the rows that are returned are aligned with ``fids``: row ``i``
+        corresponds to ``fids[i]``. See the ``fids_aligned`` parameter of
+        :func:`pyogrio.raw.read` for the exact rules. In short:
+
+        - ``fids`` must be provided, and is limited to 100 000 values;
+        - the rows are returned in the order of ``fids``, also with
+          ``use_arrow=True``;
+        - duplicate FIDs are returned once per occurrence;
+        - FIDs that do not exist are returned as a row with missing values, so a
+          missing FID does not truncate the rest of the requested FIDs;
+        - the index (with ``fid_as_index=True``) or the FID values (with
+          ``use_arrow=True`` and ``return_fids``) are exactly the requested FIDs,
+          as int64 values.
+
+        With ``fid_as_index=True`` and a missing FID, the index value for that row is
+        the requested (missing) FID. This parameter does not change the default
+        selection rules of ``fids``; it is only used when explicitly enabled.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR. Invalid
@@ -396,6 +417,7 @@ def read_dataframe(
         sql_dialect=sql_dialect,
         return_fids=fid_as_index,
         datetime_as_string=True,
+        fids_aligned=fids_aligned,
         **kwargs,
     )
 
@@ -427,6 +449,16 @@ def read_dataframe(
             #     }.get
         if arrow_to_pandas_kwargs is not None:
             kwargs.update(arrow_to_pandas_kwargs)
+
+        fid_values = None
+        if fid_as_index:
+            # The FID column is returned as the first column with its name; when an
+            # attribute column has the same name (e.g. a GeoJSON property named
+            # "OGC_FID"), keep the FID values based on their position and remove only
+            # that column, so the attribute column with the same name is preserved.
+            fid_index = _get_fid_column_position(table.schema.names, meta["fid_column"])
+            fid_values = table.column(fid_index)
+            table = table.remove_column(fid_index)
 
         try:
             df = table.to_pandas(**kwargs)
@@ -464,8 +496,13 @@ def read_dataframe(
                         )
 
         if fid_as_index:
-            df = df.set_index(meta["fid_column"])
-            df.index.names = ["fid"]
+            if fid_values is not None:
+                df.index = pd.Index(
+                    fid_values.to_numpy(zero_copy_only=False), name="fid"
+                )
+            else:
+                df = df.set_index(meta["fid_column"])
+                df.index.names = ["fid"]
 
         geometry_name = meta["geometry_name"] or "wkb_geometry"
         if not fid_as_index and len(df.columns) == 0:

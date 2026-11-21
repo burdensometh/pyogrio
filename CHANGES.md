@@ -2,6 +2,17 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add an optional ``fids_aligned=True`` mode to ``read``, ``read_arrow``,
+    ``open_arrow`` and ``read_dataframe`` to align the returned rows with the
+    requested ``fids``: rows are returned in the order of ``fids`` (also with
+    ``use_arrow=True``), duplicate FIDs are returned once per occurrence, missing
+    FIDs are returned as rows with missing values instead of truncating the request
+    at the first missing FID, and the requested FIDs are preserved as int64 values.
+    The number of FIDs is limited to 100 000 per request. The default selection
+    rules of ``fids`` are unchanged.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

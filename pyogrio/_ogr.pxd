@@ -397,11 +397,12 @@ cdef extern from "ogr_api.h":
     int                  OGR_L_TestCapability(OGRLayerH layer, const char *name)
     OGRFeatureDefnH      OGR_L_GetLayerDefn(OGRLayerH layer) nogil
     OGRFeatureH          OGR_L_GetNextFeature(OGRLayerH layer) nogil
-    OGRFeatureH          OGR_L_GetFeature(OGRLayerH layer, int nFeatureId) nogil
+    OGRFeatureH          OGR_L_GetFeature(OGRLayerH layer, int64_t nFeatureId) nogil
     void                 OGR_L_ResetReading(OGRLayerH layer) nogil
     OGRErr               OGR_L_SetAttributeFilter(OGRLayerH hLayer,
                                                   const char* pszQuery) nogil
-    OGRErr               OGR_L_SetNextByIndex(OGRLayerH layer, int nIndex) nogil
+    OGRErr               OGR_L_SetNextByIndex(OGRLayerH layer,
+                                              int64_t nIndex) nogil
     int                  OGR_L_GetFeatureCount(OGRLayerH layer, int m) nogil
     void                 OGR_L_SetSpatialFilterRect(OGRLayerH layer,
                                                     double xmin,

@@ -424,6 +424,158 @@ def test_read_fids_unsupported_keywords(naturalearth_lowres):
             read(naturalearth_lowres, fids=[1], mask=shapely.Point(0, 0))
 
 
+def test_read_fids_aligned_order(naturalearth_lowres):
+    expected_fids, expected_geometry, expected_fields = read(
+        naturalearth_lowres, return_fids=True
+    )[1:]
+
+    # requested out of order: the rows should follow the requested order
+    subset = [10, 5, 0, 12]
+    index, geometry, fields = read(
+        naturalearth_lowres, fids=subset, fids_aligned=True, return_fids=True
+    )[1:]
+
+    assert np.array_equal(index, expected_fids[subset])
+    assert np.array_equal(geometry, expected_geometry[subset])
+    assert np.array_equal(fields[-1], expected_fields[-1][subset])
+    assert index.dtype == np.int64
+
+
+def test_read_fids_aligned_duplicates(naturalearth_lowres):
+    expected_fids, expected_geometry, expected_fields = read(
+        naturalearth_lowres, return_fids=True
+    )[1:]
+
+    subset = [5, 1, 5, 5]
+    index, geometry, fields = read(
+        naturalearth_lowres, fids=subset, fids_aligned=True, return_fids=True
+    )[1:]
+
+    assert np.array_equal(index, expected_fids[subset])
+    assert np.array_equal(geometry, expected_geometry[subset])
+    assert np.array_equal(fields[-1], expected_fields[-1][subset])
+
+
+def test_read_fids_aligned_missing(naturalearth_lowres):
+    _, expected_geometry, expected_fields = read(naturalearth_lowres, return_fids=True)[
+        1:
+    ]
+
+    # a missing FID in the middle does not truncate the rest of the request
+    missing = 999
+    subset = [3, missing, 1]
+    index, geometry, fields = read(
+        naturalearth_lowres, fids=subset, fids_aligned=True, return_fids=True
+    )[1:]
+
+    assert np.array_equal(index, np.array(subset, dtype=np.int64))
+    assert geometry[0] == expected_geometry[3]
+    assert geometry[1] is None
+    assert geometry[2] == expected_geometry[1]
+
+    field = expected_fields[-1]
+    assert fields[-1][0] == field[3]
+    assert fields[-1][2] == field[1]
+    # missing row has missing values (numeric fields become NaN)
+    assert np.isnan(fields[-1][1])
+
+
+def test_read_fids_aligned_preserves_default_selection(naturalearth_lowres):
+    expected_fids = read(naturalearth_lowres, return_fids=True)[1]
+
+    subset = [0, 10, 5]
+
+    # default (unaligned) selection is unchanged: no error for a subset, but
+    # missing FIDs still raise and the order is the order in the data source
+    index = read(naturalearth_lowres, fids=subset, return_fids=True)[1]
+    assert np.array_equal(index, expected_fids[subset])
+
+    with pytest.raises(FeatureError):
+        read(naturalearth_lowres, fids=[0, 999, 5])
+
+
+def test_read_fids_aligned_validation(naturalearth_lowres):
+    with pytest.raises(ValueError, match="'fids' must be provided"):
+        read(naturalearth_lowres, fids_aligned=True)
+
+    with pytest.raises(ValueError, match="cannot set both 'fids'"):
+        read(naturalearth_lowres, fids=[1], fids_aligned=True, where="iso_a3 = 'CAN'")
+
+    with pytest.raises(ValueError, match="must contain integer values"):
+        read(naturalearth_lowres, fids=[1.5], fids_aligned=True)
+
+    with pytest.raises(ValueError, match="must be one-dimensional"):
+        read(naturalearth_lowres, fids=[[1, 2]], fids_aligned=True)
+
+
+def test_read_fids_aligned_max_fids(naturalearth_lowres):
+    from pyogrio.raw import _MAX_FIDS_ALIGNED
+
+    with pytest.raises(ValueError, match="is limited to"):
+        read(
+            naturalearth_lowres,
+            fids=np.arange(_MAX_FIDS_ALIGNED + 1),
+            fids_aligned=True,
+        )
+
+
+def test_read_fids_aligned_large_integers(tmp_path):
+    # FIDs larger than int32 should keep their exact value
+    import geopandas as gp
+
+    import shapely
+
+    from pyogrio import write_dataframe
+
+    big_fids = [2**40 + 7, 2**40 + 3, 2**50]
+    gdf = gp.GeoDataFrame(
+        {"myfid": big_fids, "a": [1, 2, 3]},
+        geometry=[shapely.Point(i, i) for i in range(3)],
+        crs="EPSG:4326",
+    )
+    path = tmp_path / "big_fids.gpkg"
+    write_dataframe(gdf, path, fid="myfid")
+
+    requested = [big_fids[2], big_fids[0]]
+    index, _, fields = read(path, fids=requested, fids_aligned=True, return_fids=True)[
+        1:
+    ]
+    assert np.array_equal(index, np.array(requested, dtype=np.int64))
+    assert np.array_equal(fields[0], [3, 1])
+
+
+@requires_pyarrow_api
+def test_read_arrow_fids_aligned_chunks(tmp_path):
+    # a request larger than a single "IN" filter is split in multiple queries
+    import pandas as pd
+
+    from pyogrio import write_dataframe
+    from pyogrio.raw import read_arrow
+
+    n = 6_000
+    df = pd.DataFrame({"a": np.arange(n, dtype=np.int64)})
+    path = tmp_path / "chunks.gpkg"
+    write_dataframe(df, path, driver="GPKG")
+
+    requested = np.arange(1, n + 1, dtype=np.int64)[::-1]
+    _, table = read_arrow(path, fids=requested, fids_aligned=True, return_fids=True)
+
+    assert np.array_equal(table.column(0).to_pylist(), requested.tolist())
+    # column "a" holds the position of the feature: fid - 1
+    assert np.array_equal(table.column(1).to_pylist(), (requested - 1).tolist())
+
+    # a missing FID that falls in a later chunk does not truncate the request
+    requested_with_missing = requested.copy()
+    requested_with_missing[5_200] = 10**6
+    _, table = read_arrow(
+        path, fids=requested_with_missing, fids_aligned=True, return_fids=True
+    )
+    assert table.num_rows == n
+    assert np.array_equal(table.column(0).to_pylist(), requested_with_missing.tolist())
+    assert table.column(1)[5_200].as_py() is None
+    assert table.column(1)[5_201].as_py() == int(requested_with_missing[5_201]) - 1
+
+
 def test_read_return_fids(naturalearth_lowres):
     # default is to not return fids
     fids = read(naturalearth_lowres)[1]

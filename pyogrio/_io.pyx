@@ -859,6 +859,20 @@ cdef apply_where_filter(OGRLayerH ogr_layer, str where):
         )
 
 
+cdef object _build_arrow_fid_filter(object fids, str fid_column):
+    """Build a filter expression that selects the requested FIDs.
+
+    Drivers that don't natively support SQL use the "OGRSQL" dialect, which only
+    supports up to 4997 values in a single "IN" clause. The caller splits larger
+    requests in chunks, so the FIDs passed here must fit in a single clause.
+    """
+    if len(fids) == 0:
+        # No FIDs requested: use a filter that matches no features
+        return "1 = 0"
+
+    return f"{fid_column} IN ({','.join(str(int(fid)) for fid in fids)})"
+
+
 cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
     """Applies bounding box spatial filter to layer.
 
@@ -1426,14 +1440,55 @@ cdef get_features(
 
 @cython.boundscheck(False)  # Deactivate bounds checking
 @cython.wraparound(False)   # Deactivate negative indexing.
+cdef void set_null_values(
+    int i,
+    int n_fields,
+    list field_data,
+    list field_data_view,
+    list field_ogr_types,
+    bint datetime_as_string,
+):
+    """Fill row ``i`` with missing values for all fields.
+
+    This mirrors the NULL handling of `process_fields`, so that rows that are
+    returned for FIDs that could not be read have the same missing values as rows
+    for features where a field is not set.
+    """
+    cdef int j
+    cdef int field_type
+
+    for j in range(n_fields):
+        field_type = field_ogr_types[j]
+        data = field_data_view[j]
+
+        if field_type in (OFTInteger, OFTInteger64, OFTReal):
+            # if a boolean or integer type, have to cast to float to hold
+            # NaN values
+            if data.dtype.kind in ("b", "i", "u"):
+                field_data[j] = field_data[j].astype(np.float64)
+                field_data_view[j] = field_data[j][:]
+                field_data_view[j][i] = np.nan
+            else:
+                data[i] = np.nan
+
+        elif field_type in (OFTDate, OFTDateTime) and not datetime_as_string:
+            data[i] = np.datetime64("NaT")
+
+        else:
+            data[i] = None
+
+
+@cython.boundscheck(False)  # Deactivate bounds checking
+@cython.wraparound(False)   # Deactivate negative indexing.
 cdef get_features_by_fid(
     OGRLayerH ogr_layer,
-    int[:] fids,
+    int64_t[:] fids,
     object[:, :] fields,
     encoding,
     uint8_t read_geometry,
     uint8_t force_2d,
-    bint datetime_as_string
+    bint datetime_as_string,
+    bint fids_aligned
 ):
     """Get features by their feature IDs (FIDs).
 
@@ -1441,7 +1496,7 @@ cdef get_features_by_fid(
     ----------
     ogr_layer : OGRLayerH
         The open OGR layer
-    fids : int[:]
+    fids : int64_t[:]
         An array of feature IDs to read
     fields : object[:, :]
         An array of fields to read
@@ -1453,6 +1508,10 @@ cdef get_features_by_fid(
         Whether to force 2D geometries
     datetime_as_string : bint
         Whether to read datetime fields as strings
+    fids_aligned : bint
+        If True, the output rows are aligned with ``fids``: FIDs that cannot be
+        read are returned as a row with missing values (and do not raise), and
+        duplicate FIDs are returned once per occurrence in ``fids``.
 
     Returns
     -------
@@ -1464,9 +1523,10 @@ cdef get_features_by_fid(
     cdef OGRFeatureH ogr_feature = NULL
     cdef int n_fields
     cdef int i
-    cdef int fid
+    cdef int64_t fid
     cdef int field_index
     cdef int count = len(fids)
+    cdef bint is_missing
 
     # make sure layer is read from beginning
     with nogil:
@@ -1496,6 +1556,7 @@ cdef get_features_by_fid(
     field_data_view = [field_data[field_index][:] for field_index in range(n_fields)]
 
     for i in range(count):
+        is_missing = False
         try:
             fid = fids[i]
 
@@ -1505,10 +1566,34 @@ cdef get_features_by_fid(
                 ogr_feature = check_pointer(ogr_feature)
 
             except NullPointerError:
-                raise FeatureError(f"Could not read feature with fid {fid}") from None
+                if not fids_aligned:
+                    raise FeatureError(
+                        f"Could not read feature with fid {fid}"
+                    ) from None
+
+                is_missing = True
 
             except CPLE_BaseError as exc:
-                raise FeatureError(str(exc))
+                if not fids_aligned or getattr(exc, "errno", -1) in (2, 3, 4):
+                    # errno 2, 3 and 4 are OutOfMemory, FileIO and OpenFailed
+                    # errors; these indicate a problem with the data source as a
+                    # whole and should not be silently converted to a missing row
+                    raise FeatureError(str(exc))
+
+                is_missing = True
+
+            if is_missing:
+                continue
+
+            if fids_aligned and OGR_F_GetFID(ogr_feature) != fid:
+                # GetFeature() returned a feature for another FID (some drivers
+                # interpret the argument as a sequential index instead of a FID). The
+                # identity of the rows cannot be guaranteed then, so refuse to return
+                # data that could be silently mislabeled.
+                raise FeatureError(
+                    f"Could not align feature for fid {fid}: the driver returned a "
+                    f"feature with fid {OGR_F_GetFID(ogr_feature)}"
+                )
 
             if read_geometry:
                 process_geometry(ogr_feature, i, geom_view, force_2d)
@@ -1521,6 +1606,15 @@ cdef get_features_by_fid(
             if ogr_feature != NULL:
                 OGR_F_Destroy(ogr_feature)
                 ogr_feature = NULL
+
+            if is_missing:
+                if read_geometry:
+                    geom_view[i] = None
+
+                set_null_values(
+                    i, n_fields, field_data, field_data_view, field_ogr_types,
+                    datetime_as_string
+                )
 
     return (geometries, field_data)
 
@@ -1636,6 +1730,7 @@ def ogr_read(
     str sql_dialect=None,
     int return_fids=False,
     bint datetime_as_string=False,
+    bint fids_aligned=False,
 ):
     """Read features from a dataset.
 
@@ -1668,7 +1763,14 @@ def ogr_read(
                 "cannot set both 'fids' and any of 'where', 'bbox', 'mask', "
                 "'sql', 'skip_features' or 'max_features'"
             )
-        fids = np.asarray(fids, dtype=np.intc)
+        if fids_aligned:
+            # keep the full integer precision of the requested FIDs
+            fids = np.asarray(fids, dtype=np.int64)
+        else:
+            fids = np.asarray(fids, dtype=np.intc)
+
+    elif fids_aligned:
+        raise ValueError("'fids' must be provided when 'fids_aligned=True'")
 
     if sql is not None and layer is not None:
         raise ValueError("'sql' parameter cannot be combined with 'layer'")
@@ -1767,12 +1869,13 @@ def ogr_read(
         if fids is not None:
             geometries, field_data = get_features_by_fid(
                 ogr_layer,
-                fids,
+                fids if fids_aligned else fids.astype(np.int64),
                 fields,
                 encoding,
                 read_geometry=read_geometry and geometry_type is not None,
                 force_2d=force_2d,
                 datetime_as_string=datetime_as_string,
+                fids_aligned=fids_aligned,
             )
 
             # bypass reading fids since these should match fids used for read
@@ -1926,6 +2029,7 @@ def ogr_open_arrow(
     int batch_size=0,
     use_pyarrow=False,
     datetime_as_string=False,
+    bint fids_aligned=False,
 ):
     """Open a file via the GDAL arrow interface.
 
@@ -2090,15 +2194,26 @@ def ogr_open_arrow(
                         stacklevel=2,
                     )
 
-            fids_str = ",".join([str(fid) for fid in fids])
-            where = f"{fid_column_where} IN ({fids_str})"
+            if fids_aligned:
+                # The aligned read filters on the requested FIDs (including missing
+                # ones, which are filtered out by the filter) and the rows are put in
+                # the requested order afterwards. Larger requests are split in chunks
+                # to stay within the limits of the default "OGRSQL" dialect.
+                fids_filter = _build_arrow_fid_filter(fids, fid_column_where)
+                where = fids_filter
+
+            else:
+                fids_str = ",".join([str(fid) for fid in fids])
+                where = f"{fid_column_where} IN ({fids_str})"
 
         # Apply the attribute filter
         if where is not None and where != "":
             try:
                 apply_where_filter(ogr_layer, where)
             except ValueError as ex:
-                if fids is not None and str(ex).startswith("Invalid SQL query"):
+                if fids is not None and not fids_aligned and str(ex).startswith(
+                    "Invalid SQL query"
+                ):
                     # If fids is not None, the where being applied is the one formatted
                     # above.
                     raise ValueError(
