@@ -2,6 +2,18 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add `update_key` parameter to `write_dataframe` and `pyogrio.raw.write` to
+    update existing features in the target layer by a business key instead of
+    always appending. For each record, a feature with the same key value
+    is updated in place (preserving its FID and replacing its geometry and
+    fields); new keys are inserted. The batch is written within a transaction
+    and is rejected as a whole (leaving the target layer unchanged) if key
+    values are missing, duplicated within the batch, or match multiple existing
+    features in the target layer. Currently only supported for the GeoPackage
+    (GPKG) driver with `append=True`.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

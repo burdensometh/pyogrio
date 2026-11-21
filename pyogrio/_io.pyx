@@ -160,13 +160,151 @@ cdef int commit_transaction(OGRDataSourceH ogr_dataset) except 1:
     return 0
 
 
-# Not currently used; uncomment when used
-# cdef int rollback_transaction(OGRDataSourceH ogr_dataset) except 1:
-#     cdef int err = GDALDatasetRollbackTransaction(ogr_dataset)
-#     if err == OGRERR_FAILURE:
-#         raise DataSourceError("Failed to rollback transaction")
+cdef int rollback_transaction(OGRDataSourceH ogr_dataset) except 1:
+    """Roll back a transaction on the dataset.
 
-#     return 0
+    Parameters
+    ----------
+    ogr_dataset : pointer
+        The open OGR dataset
+
+    """
+    cdef int err = GDALDatasetRollbackTransaction(ogr_dataset)
+    if err == OGRERR_FAILURE:
+        raise DataSourceError("Failed to rollback transaction")
+
+    return 0
+
+
+# OGR field types supported for an update key field
+UPDATE_KEY_FIELD_TYPES = {OFTString, OFTInteger, OFTInteger64}
+
+
+cdef tuple get_update_key_fid_map(
+    OGRLayerH ogr_layer, int key_field_index, int key_ogr_type
+):
+    """Map existing update key values in a layer to the FIDs of their features.
+
+    Parameters
+    ----------
+    ogr_layer : OGRLayerH
+        The open OGR layer; it is read from the start.
+    key_field_index : int
+        Index of the update key field in the layer definition.
+    key_ogr_type : int
+        OGR field type of the update key field (one of UPDATE_KEY_FIELD_TYPES).
+
+    Returns
+    -------
+    tuple of (dict, set)
+        dict mapping each existing key value to the FID of its feature, and a
+        set of key values that occur more than once in the layer.
+    """
+    cdef OGRFeatureH ogr_feature = NULL
+    cdef int64_t fid
+    key_to_fid = {}
+    duplicate_keys = set()
+
+    OGR_L_ResetReading(ogr_layer)
+    while True:
+        ogr_feature = OGR_L_GetNextFeature(ogr_layer)
+        if ogr_feature == NULL:
+            break
+
+        try:
+            if OGR_F_IsFieldSetAndNotNull(ogr_feature, key_field_index):
+                if key_ogr_type == OFTString:
+                    key = OGR_F_GetFieldAsString(
+                        ogr_feature, key_field_index
+                    ).decode("UTF-8")
+                elif key_ogr_type == OFTInteger:
+                    key = OGR_F_GetFieldAsInteger(ogr_feature, key_field_index)
+                else:
+                    key = OGR_F_GetFieldAsInteger64(ogr_feature, key_field_index)
+
+                fid = OGR_F_GetFID(ogr_feature)
+                if key in key_to_fid:
+                    duplicate_keys.add(key)
+                else:
+                    key_to_fid[key] = fid
+        finally:
+            OGR_F_Destroy(ogr_feature)
+
+    return key_to_fid, duplicate_keys
+
+
+def validate_update_key_values(
+    object field_values, object mask, int key_ogr_type, str update_key
+):
+    """Validate and normalize the update key values for a batch of records.
+
+    Values are normalized in the same way they would be written to the update
+    key field, so they can be compared against existing key values in the
+    target layer.
+
+    Parameters
+    ----------
+    field_values : ndarray
+        The values of the update key field for the batch of records.
+    mask : ndarray or None
+        Mask indicating null values, or None if the field has no mask.
+    key_ogr_type : int
+        OGR field type of the update key field in the target layer.
+    update_key : str
+        Name of the update key field (used in error messages).
+
+    Returns
+    -------
+    list
+        Normalized key values, one per record.
+
+    Raises
+    ------
+    ValueError
+        If a key value is missing, is duplicated within the batch, or has a
+        type that is incompatible with the key field in the target layer.
+    """
+    keys = []
+    key_indexes = {}
+
+    for i in range(len(field_values)):
+        value = field_values[i]
+
+        if mask is not None and mask[i]:
+            value = None
+
+        if value is None or (isinstance(value, (float, np.floating)) and isnan(value)):
+            raise ValueError(
+                f"update_key field '{update_key}' has a missing value at record "
+                f"index {i}; all records must have a value for the update key"
+            )
+
+        if key_ogr_type == OFTString:
+            # normalize the same way values are written to string fields below
+            key = value if isinstance(value, str) else str(value)
+
+        else:
+            # OFTInteger / OFTInteger64
+            if not isinstance(value, (int, np.integer)):
+                raise ValueError(
+                    f"update_key field '{update_key}' has value {value!r} at "
+                    f"record index {i} that cannot be interpreted as an integer, "
+                    "but the update key field in the target layer has an integer "
+                    "type"
+                )
+            key = int(value)
+
+        if key in key_indexes:
+            raise ValueError(
+                f"update_key field '{update_key}' has duplicate value {key!r} at "
+                f"record indexes {key_indexes[key]} and {i}; update key values "
+                "must be unique within a batch"
+            )
+
+        key_indexes[key] = i
+        keys.append(key)
+
+    return keys
 
 
 cdef char** dict_to_options(object values):
@@ -2916,7 +3054,8 @@ def ogr_write(
     bint append=False,
     dataset_metadata=None,
     layer_metadata=None,
-    gdal_tz_offsets=None
+    gdal_tz_offsets=None,
+    update_key=None,
 ):
     """Write the data to a file."""
     cdef OGRDataSourceH ogr_dataset = NULL
@@ -2938,12 +3077,29 @@ def ogr_write(
     cdef int field_index
     cdef int field_type
     cdef bint use_tmp_vsimem = False
+    cdef int key_field_index = -1
+    cdef int key_ogr_type = -1
 
     if num_fields != num_field_data:
         raise ValueError("field_data array needs to be same length as fields array")
 
     if num_fields == 0 and geometry is None:
         raise ValueError("You must provide at least a geometry column or a field")
+
+    if update_key is not None:
+        if not append:
+            raise ValueError("'update_key' requires append=True")
+
+        if driver != "GPKG":
+            raise NotImplementedError(
+                "'update_key' is currently only supported for the GeoPackage "
+                "(GPKG) driver"
+            )
+
+        if fields is None or update_key not in fields:
+            raise ValueError(
+                f"update_key field '{update_key}' is not present in fields"
+            )
 
     if num_fields > 0:
         num_records = len(field_data[0])
@@ -3055,178 +3211,259 @@ def ogr_write(
         if field_types is not None:
             field_ogr_types = list(field_types[:, 0])
 
+        key_values = None
+        key_to_fid = None
+        if update_key is not None:
+            # locate the update key field in the target layer
+            key_field_index = OGR_FD_GetFieldIndex(
+                ogr_featuredef, update_key.encode(encoding)
+            )
+            if key_field_index < 0:
+                raise FieldError(
+                    f"update_key field '{update_key}' does not exist in the "
+                    f"target layer '{layer}'"
+                )
+
+            key_ogr_type = OGR_Fld_GetType(
+                OGR_FD_GetFieldDefn(ogr_featuredef, key_field_index)
+            )
+            if key_ogr_type not in UPDATE_KEY_FIELD_TYPES:
+                raise NotImplementedError(
+                    f"update_key field '{update_key}' has unsupported field type "
+                    f"'{FIELD_TYPE_NAMES.get(key_ogr_type, key_ogr_type)}' in the "
+                    "target layer; only string and integer fields are supported"
+                )
+
+            # validate and normalize the key values of the batch; raises on
+            # missing or duplicate key values within the batch
+            key_field_pos = fields.index(update_key)
+            key_values = validate_update_key_values(
+                field_data[key_field_pos],
+                field_mask[key_field_pos],
+                key_ogr_type,
+                update_key,
+            )
+
+            if not layer_created:
+                # map existing key values in the target layer to their FIDs
+                key_to_fid, duplicate_target_keys = get_update_key_fid_map(
+                    ogr_layer, key_field_index, key_ogr_type
+                )
+
+                # key values that already occur multiple times in the target
+                # layer cannot be updated unambiguously
+                conflicts = [
+                    key for key in key_values if key in duplicate_target_keys
+                ]
+                if conflicts:
+                    raise ValueError(
+                        f"update_key field '{update_key}' has "
+                        f"{len(conflicts)} value(s) that match multiple existing "
+                        f"features in the target layer (e.g. {conflicts[0]!r}); "
+                        "the duplicated features in the target layer must be "
+                        "resolved before updating by key"
+                    )
+            else:
+                key_to_fid = {}
+
         # Create the features
         supports_transactions = OGR_L_TestCapability(ogr_layer, OLCTransactions)
         if supports_transactions:
             start_transaction(ogr_dataset, 0)
 
-        for i in range(num_records):
-            # create the feature
-            ogr_feature = OGR_F_Create(ogr_featuredef)
-            if ogr_feature == NULL:
-                raise FeatureError(f"Could not create feature at index {i}") from None
+        try:
+            for i in range(num_records):
+                # create the feature
+                ogr_feature = OGR_F_Create(ogr_featuredef)
+                if ogr_feature == NULL:
+                    raise FeatureError(f"Could not create feature at index {i}") from None
 
-            # create the geometry based on specific WKB type
-            # (there might be mixed types in geometries)
-            # TODO: geometry must not be null or errors
-            wkb = None if geometry is None else geometry[i]
-            if wkb is not None:
-                wkb_buffer = wkb
-                if wkb_buffer[0] == 1:
-                    # Little endian WKB type.
-                    wkbtype = (
-                        wkb_buffer[1] + (wkb_buffer[2] << 8) + (wkb_buffer[3] << 16) +
-                        (<unsigned int>wkb_buffer[4] << 24)
-                    )
-                else:
-                    # Big endian WKB type.
-                    wkbtype = (
-                        (<unsigned int>(wkb_buffer[1]) << 24) + (wkb_buffer[2] << 16) +
-                        (wkb_buffer[3] << 8) + wkb_buffer[4]
-                    )
-                ogr_geometry = OGR_G_CreateGeometry(<OGRwkbGeometryType>wkbtype)
-                if ogr_geometry == NULL:
-                    raise GeometryError(
-                        f"Could not create geometry at index {i} for WKB type {wkbtype}"
-                    ) from None
+                # create the geometry based on specific WKB type
+                # (there might be mixed types in geometries)
+                # TODO: geometry must not be null or errors
+                wkb = None if geometry is None else geometry[i]
+                if wkb is not None:
+                    wkb_buffer = wkb
+                    if wkb_buffer[0] == 1:
+                        # Little endian WKB type.
+                        wkbtype = (
+                            wkb_buffer[1] + (wkb_buffer[2] << 8) + (wkb_buffer[3] << 16) +
+                            (<unsigned int>wkb_buffer[4] << 24)
+                        )
+                    else:
+                        # Big endian WKB type.
+                        wkbtype = (
+                            (<unsigned int>(wkb_buffer[1]) << 24) + (wkb_buffer[2] << 16) +
+                            (wkb_buffer[3] << 8) + wkb_buffer[4]
+                        )
+                    ogr_geometry = OGR_G_CreateGeometry(<OGRwkbGeometryType>wkbtype)
+                    if ogr_geometry == NULL:
+                        raise GeometryError(
+                            f"Could not create geometry at index {i} for WKB type {wkbtype}"
+                        ) from None
 
-                # import the WKB
-                err = OGR_G_ImportFromWkb(ogr_geometry, wkb_buffer, len(wkb))
-                if err:
-                    raise GeometryError(
-                        f"Could not create geometry from WKB at index {i}"
-                    ) from None
+                    # import the WKB
+                    err = OGR_G_ImportFromWkb(ogr_geometry, wkb_buffer, len(wkb))
+                    if err:
+                        raise GeometryError(
+                            f"Could not create geometry from WKB at index {i}"
+                        ) from None
 
-                # Convert to multi type
-                if promote_to_multi:
-                    if wkbtype in (wkbPoint, wkbPoint25D, wkbPointM, wkbPointZM):
-                        ogr_geometry = OGR_G_ForceToMultiPoint(ogr_geometry)
-                    elif wkbtype in (
-                        wkbLineString, wkbLineString25D, wkbLineStringM, wkbLineStringZM
-                    ):
-                        ogr_geometry = OGR_G_ForceToMultiLineString(ogr_geometry)
-                    elif wkbtype in (
-                        wkbPolygon, wkbPolygon25D, wkbPolygonM, wkbPolygonZM
-                    ):
-                        ogr_geometry = OGR_G_ForceToMultiPolygon(ogr_geometry)
+                    # Convert to multi type
+                    if promote_to_multi:
+                        if wkbtype in (wkbPoint, wkbPoint25D, wkbPointM, wkbPointZM):
+                            ogr_geometry = OGR_G_ForceToMultiPoint(ogr_geometry)
+                        elif wkbtype in (
+                            wkbLineString, wkbLineString25D, wkbLineStringM, wkbLineStringZM
+                        ):
+                            ogr_geometry = OGR_G_ForceToMultiLineString(ogr_geometry)
+                        elif wkbtype in (
+                            wkbPolygon, wkbPolygon25D, wkbPolygonM, wkbPolygonZM
+                        ):
+                            ogr_geometry = OGR_G_ForceToMultiPolygon(ogr_geometry)
 
-                # Set the geometry on the feature
-                # this assumes ownership of the geometry and it's cleanup
-                err = OGR_F_SetGeometryDirectly(ogr_feature, ogr_geometry)
-                ogr_geometry = NULL  # to prevent cleanup after this point
-                if err:
-                    raise GeometryError(
-                        f"Could not set geometry for feature at index {i}"
-                    ) from None
+                    # Set the geometry on the feature
+                    # this assumes ownership of the geometry and it's cleanup
+                    err = OGR_F_SetGeometryDirectly(ogr_feature, ogr_geometry)
+                    ogr_geometry = NULL  # to prevent cleanup after this point
+                    if err:
+                        raise GeometryError(
+                            f"Could not set geometry for feature at index {i}"
+                        ) from None
 
-            # Set field values
-            for field_idx in range(num_fields):
-                field_value = field_data[field_idx][i]
-                field_type = field_ogr_types[field_idx]
-                field_index = field_indexes[field_idx]
+                # Set field values
+                for field_idx in range(num_fields):
+                    field_value = field_data[field_idx][i]
+                    field_type = field_ogr_types[field_idx]
+                    field_index = field_indexes[field_idx]
 
-                mask = field_mask[field_idx]
-                if mask is not None and mask[i]:
-                    OGR_F_SetFieldNull(ogr_feature, field_index)
-
-                elif field_type == OFTString:
-                    if (
-                        field_value is None
-                        or (isinstance(field_value, float) and isnan(field_value))
-                    ):
+                    mask = field_mask[field_idx]
+                    if mask is not None and mask[i]:
                         OGR_F_SetFieldNull(ogr_feature, field_index)
 
-                    else:
-                        if not isinstance(field_value, str):
-                            field_value = str(field_value)
+                    elif field_type == OFTString:
+                        if (
+                            field_value is None
+                            or (isinstance(field_value, float) and isnan(field_value))
+                        ):
+                            OGR_F_SetFieldNull(ogr_feature, field_index)
 
-                        try:
-                            value_b = field_value.encode(encoding)
-                            OGR_F_SetFieldString(ogr_feature, field_index, value_b)
+                        else:
+                            if not isinstance(field_value, str):
+                                field_value = str(field_value)
 
-                        except AttributeError:
-                            raise ValueError(
-                                f"Could not encode value '{field_value}' in field "
-                                f"'{fields[field_idx]}' to string"
+                            try:
+                                value_b = field_value.encode(encoding)
+                                OGR_F_SetFieldString(ogr_feature, field_index, value_b)
+
+                            except AttributeError:
+                                raise ValueError(
+                                    f"Could not encode value '{field_value}' in field "
+                                    f"'{fields[field_idx]}' to string"
+                                )
+
+                            except Exception:
+                                raise
+
+                    elif field_type == OFTInteger:
+                        OGR_F_SetFieldInteger(ogr_feature, field_index, field_value)
+
+                    elif field_type == OFTInteger64:
+                        OGR_F_SetFieldInteger64(ogr_feature, field_index, field_value)
+
+                    elif field_type == OFTReal:
+                        if nan_as_null and isnan(field_value):
+                            OGR_F_SetFieldNull(ogr_feature, field_index)
+                        else:
+                            OGR_F_SetFieldDouble(ogr_feature, field_index, field_value)
+
+                    elif field_type == OFTDate:
+                        if np.isnat(field_value):
+                            OGR_F_SetFieldNull(ogr_feature, field_index)
+                        else:
+                            datetime_value = field_value.item()
+                            OGR_F_SetFieldDateTimeEx(
+                                ogr_feature,
+                                field_index,
+                                datetime_value.year,
+                                datetime_value.month,
+                                datetime_value.day,
+                                0,
+                                0,
+                                0.0,
+                                0
                             )
 
-                        except Exception:
-                            raise
-
-                elif field_type == OFTInteger:
-                    OGR_F_SetFieldInteger(ogr_feature, field_index, field_value)
-
-                elif field_type == OFTInteger64:
-                    OGR_F_SetFieldInteger64(ogr_feature, field_index, field_value)
-
-                elif field_type == OFTReal:
-                    if nan_as_null and isnan(field_value):
-                        OGR_F_SetFieldNull(ogr_feature, field_index)
-                    else:
-                        OGR_F_SetFieldDouble(ogr_feature, field_index, field_value)
-
-                elif field_type == OFTDate:
-                    if np.isnat(field_value):
-                        OGR_F_SetFieldNull(ogr_feature, field_index)
-                    else:
-                        datetime_value = field_value.item()
-                        OGR_F_SetFieldDateTimeEx(
-                            ogr_feature,
-                            field_index,
-                            datetime_value.year,
-                            datetime_value.month,
-                            datetime_value.day,
-                            0,
-                            0,
-                            0.0,
-                            0
-                        )
-
-                elif field_type == OFTDateTime:
-                    if np.isnat(field_value):
-                        OGR_F_SetFieldNull(ogr_feature, field_index)
-                    else:
-                        datetime_value = field_value.astype("datetime64[ms]").item()
-                        tz_array = gdal_tz_offsets.get(fields[field_idx], None)
-                        if tz_array is None:
-                            gdal_tz = 0
-                        elif np.isnan(tz_array[i]):
-                            gdal_tz = 0
+                    elif field_type == OFTDateTime:
+                        if np.isnat(field_value):
+                            OGR_F_SetFieldNull(ogr_feature, field_index)
                         else:
-                            gdal_tz = tz_array[i]
-                        OGR_F_SetFieldDateTimeEx(
-                            ogr_feature,
-                            field_index,
-                            datetime_value.year,
-                            datetime_value.month,
-                            datetime_value.day,
-                            datetime_value.hour,
-                            datetime_value.minute,
-                            datetime_value.second + datetime_value.microsecond / 10**6,
-                            gdal_tz
+                            datetime_value = field_value.astype("datetime64[ms]").item()
+                            tz_array = gdal_tz_offsets.get(fields[field_idx], None)
+                            if tz_array is None:
+                                gdal_tz = 0
+                            elif np.isnan(tz_array[i]):
+                                gdal_tz = 0
+                            else:
+                                gdal_tz = tz_array[i]
+                            OGR_F_SetFieldDateTimeEx(
+                                ogr_feature,
+                                field_index,
+                                datetime_value.year,
+                                datetime_value.month,
+                                datetime_value.day,
+                                datetime_value.hour,
+                                datetime_value.minute,
+                                datetime_value.second + datetime_value.microsecond / 10**6,
+                                gdal_tz
+                            )
+
+                    else:
+                        raise NotImplementedError(
+                            f"OGR field type is not supported for writing: {field_type}"
                         )
 
-                else:
-                    raise NotImplementedError(
-                        f"OGR field type is not supported for writing: {field_type}"
-                    )
+                # Add feature to the layer
+                try:
+                    if update_key is not None:
+                        existing_fid = key_to_fid.get(key_values[i])
+                        if existing_fid is None:
+                            # no feature with this key yet: insert a new one
+                            check_int(OGR_L_CreateFeature(ogr_layer, ogr_feature))
+                        else:
+                            # update the existing feature in place, preserving
+                            # its FID
+                            check_int(OGR_F_SetFID(ogr_feature, existing_fid))
+                            check_int(OGR_L_SetFeature(ogr_layer, ogr_feature))
+                    else:
+                        check_int(OGR_L_CreateFeature(ogr_layer, ogr_feature))
 
-            # Add feature to the layer
-            try:
-                check_int(OGR_L_CreateFeature(ogr_layer, ogr_feature))
+                except CPLE_BaseError as exc:
+                    raise FeatureError(
+                        f"Could not add feature to layer at index {i}: {exc}"
+                    ) from None
 
-            except CPLE_BaseError as exc:
-                raise FeatureError(
-                    f"Could not add feature to layer at index {i}: {exc}"
-                ) from None
+                OGR_F_Destroy(ogr_feature)
+                ogr_feature = NULL
 
-            OGR_F_Destroy(ogr_feature)
-            ogr_feature = NULL
+        except Exception:
+            # roll back so that a failed batch leaves the existing data
+            # untouched (the target layer keeps its previous state)
+            if supports_transactions:
+                try:
+                    rollback_transaction(ogr_dataset)
+                except Exception:
+                    # do not mask the original error
+                    pass
+            raise
 
         if supports_transactions:
             commit_transaction(ogr_dataset)
 
-        log.info(f"Created {num_records:,} records")
+        if update_key is not None:
+            log.info(f"Wrote {num_records:,} records (inserted or updated by key)")
+        else:
+            log.info(f"Created {num_records:,} records")
 
         # close dataset to force driver to flush data
         exc = ogr_close(ogr_dataset)

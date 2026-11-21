@@ -274,6 +274,7 @@ cdef extern from "ogr_api.h":
     void            OGR_F_Destroy(OGRFeatureH feature)
 
     int64_t         OGR_F_GetFID(OGRFeatureH feature)
+    OGRErr          OGR_F_SetFID(OGRFeatureH feature, int64_t fid)
     OGRGeometryH    OGR_F_GetGeometryRef(OGRFeatureH feature)
     GByte*          OGR_F_GetFieldAsBinary(OGRFeatureH feature, int n, int *s)
     int             OGR_F_GetFieldAsDateTimeEx(OGRFeatureH feature,
@@ -383,6 +384,7 @@ cdef extern from "ogr_api.h":
     OGRwkbGeometryType  OGR_GT_SetModifier(OGRwkbGeometryType eType, int setZ, int setM)
 
     OGRErr              OGR_L_CreateFeature(OGRLayerH layer, OGRFeatureH feature)
+    OGRErr              OGR_L_SetFeature(OGRLayerH layer, OGRFeatureH feature)
     OGRErr              OGR_L_CreateField(OGRLayerH layer,
                                           OGRFieldDefnH fielddefn,
                                           int flexible)

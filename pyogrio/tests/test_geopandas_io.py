@@ -2340,6 +2340,236 @@ def test_write_dataframe_append(request, tmp_path, naturalearth_lowres, ext, use
     assert len(read_dataframe(filename)) == 354
 
 
+def _update_key_gdf(keys, areas, coords):
+    """Small test GeoDataFrame with a business key column 'parcel_id'."""
+    return gp.GeoDataFrame(
+        {"parcel_id": keys, "area": areas},
+        geometry=[Point(x, y) for x, y in coords],
+        crs="EPSG:4326",
+    )
+
+
+def test_write_dataframe_update_key(tmp_path):
+    # updating an existing layer by business key updates matching features in
+    # place (preserving their FIDs) and only inserts genuinely new keys
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(
+        _update_key_gdf(["A", "B", "C"], [1.0, 2.0, 3.0], [(0, 0), (10, 10), (20, 20)]),
+        filename,
+    )
+
+    # correction file: "B" is updated (moved geometry + updated attribute),
+    # "D" is new
+    write_dataframe(
+        _update_key_gdf(["B", "D"], [22.0, 4.0], [(50, 50), (30, 30)]),
+        filename,
+        append=True,
+        update_key="parcel_id",
+    )
+
+    result = read_dataframe(filename, fid_as_index=True)
+
+    # no duplicated business keys
+    assert len(result) == 4
+    assert sorted(result["parcel_id"]) == ["A", "B", "C", "D"]
+
+    # FIDs of pre-existing features are preserved; the new feature gets a new FID
+    assert result["parcel_id"].tolist() == ["A", "B", "C", "D"]
+    assert result.index.tolist() == [1, 2, 3, 4]
+
+    # attributes and geometry of "B" were really updated
+    row_b = result[result["parcel_id"] == "B"].iloc[0]
+    assert row_b["area"] == 22.0
+    assert row_b.geometry.x == 50
+    assert row_b.geometry.y == 50
+
+
+def test_write_dataframe_update_key_integer(tmp_path):
+    # integer business keys are supported
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(
+        _update_key_gdf([1, 2, 3], [10, 20, 30], [(0, 0), (1, 1), (2, 2)]),
+        filename,
+    )
+    write_dataframe(
+        _update_key_gdf([2, 4], [200, 40], [(9, 9), (3, 3)]),
+        filename,
+        append=True,
+        update_key="parcel_id",
+    )
+
+    result = read_dataframe(filename, fid_as_index=True).sort_values("parcel_id")
+    assert result["parcel_id"].tolist() == [1, 2, 3, 4]
+    assert result["area"].tolist() == [10, 200, 30, 40]
+    assert result.index.tolist() == [1, 2, 3, 4]
+
+
+def test_write_dataframe_update_key_new_layer(tmp_path):
+    # update_key also works when the target layer does not exist yet; all
+    # records are then inserted
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(
+        _update_key_gdf(["A", "B"], [1.0, 2.0], [(0, 0), (1, 1)]),
+        filename,
+        append=True,
+        update_key="parcel_id",
+    )
+
+    result = read_dataframe(filename)
+    assert sorted(result["parcel_id"]) == ["A", "B"]
+
+
+def test_write_dataframe_update_key_spatial_filter_updated(tmp_path):
+    # after an update that moves a geometry, both reading back and spatial
+    # filters reflect the new location
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(_update_key_gdf(["A"], [1.0], [(0, 0)]), filename)
+    write_dataframe(
+        _update_key_gdf(["A"], [1.0], [(50, 50)]),
+        filename,
+        append=True,
+        update_key="parcel_id",
+    )
+
+    assert len(read_dataframe(filename)) == 1
+
+    # spatial filter at the new location finds the feature ...
+    result = read_dataframe(filename, bbox=(49, 49, 51, 51))
+    assert result["parcel_id"].tolist() == ["A"]
+
+    # ... and the old location no longer does
+    assert len(read_dataframe(filename, bbox=(-1, -1, 1, 1))) == 0
+
+
+def test_write_dataframe_update_key_batch_duplicate_keys(tmp_path):
+    # duplicate key values within a batch are rejected and leave the target
+    # layer unchanged
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(_update_key_gdf(["A", "B"], [1.0, 2.0], [(0, 0), (1, 1)]), filename)
+
+    with pytest.raises(ValueError, match="duplicate value 'B'"):
+        write_dataframe(
+            _update_key_gdf(["B", "B"], [3.0, 4.0], [(2, 2), (3, 3)]),
+            filename,
+            append=True,
+            update_key="parcel_id",
+        )
+
+    result = read_dataframe(filename)
+    assert result["parcel_id"].tolist() == ["A", "B"]
+    assert result["area"].tolist() == [1.0, 2.0]
+
+
+def test_write_dataframe_update_key_missing_key_value(tmp_path):
+    # records without a key value are rejected and leave the target layer
+    # unchanged
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(_update_key_gdf(["A", "B"], [1.0, 2.0], [(0, 0), (1, 1)]), filename)
+
+    with pytest.raises(ValueError, match="missing value at record index 1"):
+        write_dataframe(
+            _update_key_gdf(["B", None], [3.0, 4.0], [(2, 2), (3, 3)]),
+            filename,
+            append=True,
+            update_key="parcel_id",
+        )
+
+    result = read_dataframe(filename)
+    assert result["parcel_id"].tolist() == ["A", "B"]
+    assert result["area"].tolist() == [1.0, 2.0]
+
+
+def test_write_dataframe_update_key_missing_key_column(tmp_path):
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(_update_key_gdf(["A"], [1.0], [(0, 0)]), filename)
+
+    with pytest.raises(ValueError, match="'other' is not present in fields"):
+        write_dataframe(
+            _update_key_gdf(["A"], [1.0], [(0, 0)]),
+            filename,
+            append=True,
+            update_key="other",
+        )
+
+
+def test_write_dataframe_update_key_target_duplicates(tmp_path):
+    # if the target layer already contains multiple features with the same key
+    # (e.g. from earlier plain appends), updating that key is rejected and
+    # leaves the target layer unchanged
+    filename = tmp_path / "parcels.gpkg"
+
+    write_dataframe(_update_key_gdf(["A", "B"], [1.0, 2.0], [(0, 0), (1, 1)]), filename)
+    # legacy plain append duplicates "B" in the target
+    write_dataframe(_update_key_gdf(["B"], [3.0], [(2, 2)]), filename, append=True)
+
+    with pytest.raises(ValueError, match="match multiple existing features"):
+        write_dataframe(
+            _update_key_gdf(["B"], [4.0], [(3, 3)]),
+            filename,
+            append=True,
+            update_key="parcel_id",
+        )
+
+    result = read_dataframe(filename)
+    assert result["parcel_id"].tolist() == ["A", "B", "B"]
+    assert result["area"].tolist() == [1.0, 2.0, 3.0]
+
+    # updating a non-duplicated key still works
+    write_dataframe(
+        _update_key_gdf(["A"], [10.0], [(5, 5)]),
+        filename,
+        append=True,
+        update_key="parcel_id",
+    )
+    result = read_dataframe(filename)
+    assert result[result["parcel_id"] == "A"]["area"].tolist() == [10.0]
+
+
+def test_write_dataframe_update_key_requires_append(tmp_path):
+    filename = tmp_path / "parcels.gpkg"
+
+    with pytest.raises(ValueError, match="requires append=True"):
+        write_dataframe(
+            _update_key_gdf(["A"], [1.0], [(0, 0)]),
+            filename,
+            update_key="parcel_id",
+        )
+
+
+@pytest.mark.parametrize("ext", [".shp", ".geojson"])
+def test_write_dataframe_update_key_unsupported_driver(tmp_path, ext):
+    # update_key is currently only supported for GeoPackage
+    filename = tmp_path / f"parcels{ext}"
+
+    with pytest.raises(NotImplementedError, match="only supported for the GeoPackage"):
+        write_dataframe(
+            _update_key_gdf(["A"], [1.0], [(0, 0)]),
+            filename,
+            append=True,
+            update_key="parcel_id",
+        )
+
+
+def test_write_dataframe_update_key_use_arrow_unsupported(tmp_path):
+    filename = tmp_path / "parcels.gpkg"
+
+    with pytest.raises(ValueError, match="not supported with use_arrow=True"):
+        write_dataframe(
+            _update_key_gdf(["A"], [1.0], [(0, 0)]),
+            filename,
+            append=True,
+            update_key="parcel_id",
+            use_arrow=True,
+        )
+
+
 @pytest.mark.parametrize("spatial_index", [False, True])
 @pytest.mark.requires_arrow_write_api
 def test_write_dataframe_gdal_options(

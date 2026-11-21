@@ -19,7 +19,7 @@ from pyogrio import (
     set_gdal_config_options,
 )
 from pyogrio._compat import GDAL_GE_37, GDAL_GE_313, HAS_PYARROW, HAS_SHAPELY
-from pyogrio.errors import DataLayerError, DataSourceError, FeatureError
+from pyogrio.errors import DataLayerError, DataSourceError, FeatureError, GeometryError
 from pyogrio.raw import open_arrow, read, write
 from pyogrio.tests.conftest import (
     DRIVER_EXT,
@@ -496,6 +496,122 @@ def test_write_gpkg_multiple_layers(tmp_path, naturalearth_lowres):
     assert np.array_equal(
         list_layers(filename), [["first", "MultiPolygon"], ["second", "MultiPolygon"]]
     )
+
+
+@requires_shapely
+def test_write_gpkg_update_key(tmp_path):
+    # writing with update_key updates existing features by business key
+    # (preserving their FIDs) and inserts features with new keys
+    filename = tmp_path / "test.gpkg"
+
+    fields = ["key", "value"]
+    write(
+        filename,
+        geometry=shapely.to_wkb(shapely.points([[0, 0], [1, 1], [2, 2]])),
+        field_data=[
+            np.array(["A", "B", "C"], dtype=object),
+            np.array([1.0, 2.0, 3.0]),
+        ],
+        fields=fields,
+        geometry_type="Point",
+        crs="EPSG:4326",
+        driver="GPKG",
+    )
+
+    # correction batch: "B" is updated, "D" is inserted
+    write(
+        filename,
+        geometry=shapely.to_wkb(shapely.points([[10, 10], [3, 3]])),
+        field_data=[np.array(["B", "D"], dtype=object), np.array([22.0, 4.0])],
+        fields=fields,
+        geometry_type="Point",
+        crs="EPSG:4326",
+        driver="GPKG",
+        append=True,
+        update_key="key",
+    )
+
+    _, fids, geometry, field_data = read(filename, return_fids=True)
+
+    # no duplicated business keys; FIDs of existing features are preserved
+    assert field_data[0].tolist() == ["A", "B", "C", "D"]
+    assert fids.tolist() == [1, 2, 3, 4]
+    assert field_data[1].tolist() == [1.0, 22.0, 3.0, 4.0]
+
+    # geometry of "B" was really updated
+    points = shapely.from_wkb(geometry)
+    assert shapely.get_coordinates(points[1]).tolist() == [[10.0, 10.0]]
+
+
+@requires_shapely
+def test_write_gpkg_update_key_batch_rollback(tmp_path):
+    # a failure partway through a batch rolls back the whole batch: the target
+    # layer keeps its previous state
+    filename = tmp_path / "test.gpkg"
+
+    fields = ["key", "value"]
+    write(
+        filename,
+        geometry=shapely.to_wkb(shapely.points([[0, 0], [1, 1]])),
+        field_data=[np.array(["A", "B"], dtype=object), np.array([1.0, 2.0])],
+        fields=fields,
+        geometry_type="Point",
+        crs="EPSG:4326",
+        driver="GPKG",
+    )
+
+    # first record is a valid update, second record has a corrupt WKB geometry
+    geometry = np.array(
+        [shapely.to_wkb(shapely.Point(5, 5)), b"\x01\x01\x00\x00\x00corrupt"],
+        dtype=object,
+    )
+    with pytest.raises(GeometryError):
+        write(
+            filename,
+            geometry=geometry,
+            field_data=[np.array(["A", "C"], dtype=object), np.array([9.0, 9.0])],
+            fields=fields,
+            geometry_type="Point",
+            crs="EPSG:4326",
+            driver="GPKG",
+            append=True,
+            update_key="key",
+        )
+
+    # the whole batch was rolled back: "A" was not updated and "C" not inserted
+    _, fids, _, field_data = read(filename, return_fids=True)
+    assert field_data[0].tolist() == ["A", "B"]
+    assert field_data[1].tolist() == [1.0, 2.0]
+    assert fids.tolist() == [1, 2]
+
+
+def test_write_update_key_requires_append(tmp_path):
+    filename = tmp_path / "test.gpkg"
+
+    with pytest.raises(ValueError, match="requires append=True"):
+        write(
+            filename,
+            geometry=None,
+            field_data=[np.array(["A"], dtype=object)],
+            fields=["key"],
+            driver="GPKG",
+            update_key="key",
+        )
+
+
+def test_write_update_key_unsupported_driver(tmp_path):
+    filename = tmp_path / "test.geojson"
+
+    with pytest.raises(NotImplementedError, match="only supported for the GeoPackage"):
+        write(
+            filename,
+            geometry=None,
+            field_data=[np.array(["A"], dtype=object)],
+            fields=["key"],
+            driver="GeoJSON",
+            append=True,
+            update_key="key",
+        )
 
 
 def test_write_geojson(tmp_path, naturalearth_lowres):

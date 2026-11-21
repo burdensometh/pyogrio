@@ -607,6 +607,7 @@ def write(
     promote_to_multi=None,
     nan_as_null=True,
     append=False,
+    update_key=None,
     dataset_metadata=None,
     layer_metadata=None,
     metadata=None,
@@ -676,6 +677,23 @@ def write(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+    update_key : str, optional (default: None)
+        Name of a field to use as a business key to update existing features
+        in the target layer instead of always appending new ones.  Requires
+        ``append=True`` and is currently only supported for the GeoPackage
+        (GPKG) driver.
+
+        For each record, if a feature with the same key value already exists
+        in the target layer, that feature is updated in place (its FID is
+        preserved and its geometry and fields are replaced); otherwise a new
+        feature is inserted.  The whole batch is written within a transaction:
+        if any record fails, the target layer is left unchanged.
+
+        Key values must be unique within the batch and may not be missing.  If
+        a key value matches multiple existing features in the target layer
+        (i.e. the target already contains duplicates of the key), an error is
+        raised and the target layer is left unchanged.  The update key field
+        must be a string or integer field.
     dataset_metadata : dict, optional (default: None)
         Metadata to be stored at the dataset level in the output file; limited
         to drivers that support writing metadata, such as GPKG, and silently
@@ -706,6 +724,21 @@ def write(
     kwargs.pop("ogr_subtypes", None)
 
     path, driver = _get_write_path_driver(path, driver, append=append)
+
+    if update_key is not None:
+        if not append:
+            raise ValueError("'update_key' requires append=True")
+
+        if driver != "GPKG":
+            raise NotImplementedError(
+                "'update_key' is currently only supported for the GeoPackage "
+                "(GPKG) driver"
+            )
+
+        if fields is None or update_key not in fields:
+            raise ValueError(
+                f"update_key field '{update_key}' is not present in fields"
+            )
 
     dataset_metadata, layer_metadata = _validate_metadata(
         dataset_metadata, layer_metadata, metadata
@@ -749,6 +782,7 @@ def write(
         dataset_kwargs=dataset_kwargs,
         layer_kwargs=layer_kwargs,
         gdal_tz_offsets=gdal_tz_offsets,
+        update_key=update_key,
     )
 
 

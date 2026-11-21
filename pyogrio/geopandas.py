@@ -535,6 +535,7 @@ def write_dataframe(
     promote_to_multi=None,
     nan_as_null=True,
     append=False,
+    update_key=None,
     use_arrow=None,
     dataset_metadata=None,
     layer_metadata=None,
@@ -601,6 +602,23 @@ def write_dataframe(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+    update_key : str, optional (default: None)
+        Name of a column to use as a business key to update existing features
+        in the target layer instead of always appending new ones.  Requires
+        ``append=True`` and is currently only supported for the GeoPackage
+        (GPKG) driver; cannot be combined with ``use_arrow=True``.
+
+        For each record, if a feature with the same key value already exists
+        in the target layer, that feature is updated in place (its FID is
+        preserved and its geometry and fields are replaced); otherwise a new
+        feature is inserted.  The whole batch is written within a transaction:
+        if any record fails, the target layer is left unchanged.
+
+        Key values must be unique within the batch and may not be missing.  If
+        a key value matches multiple existing features in the target layer
+        (i.e. the target already contains duplicates of the key), an error is
+        raised and the target layer is left unchanged.  The update key column
+        must be a string or integer column.
     use_arrow : bool, optional (default: False)
         Whether to use Arrow as the transfer mechanism of the data to write
         from Python to GDAL (requires GDAL >= 3.8 and `pyarrow` to be
@@ -660,6 +678,10 @@ def write_dataframe(
 
     if use_arrow is None:
         use_arrow = bool(int(os.environ.get("PYOGRIO_USE_ARROW", "0")))
+
+    if update_key is not None and use_arrow:
+        raise ValueError("'update_key' is not supported with use_arrow=True")
+
     path, driver = _get_write_path_driver(path, driver, append=append)
 
     geometry_columns = df.columns[df.dtypes == "geometry"]
@@ -959,6 +981,7 @@ def write_dataframe(
         promote_to_multi=promote_to_multi,
         nan_as_null=nan_as_null,
         append=append,
+        update_key=update_key,
         dataset_metadata=dataset_metadata,
         layer_metadata=layer_metadata,
         metadata=metadata,
