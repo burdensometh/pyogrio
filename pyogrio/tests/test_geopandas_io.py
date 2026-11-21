@@ -2340,6 +2340,38 @@ def test_write_dataframe_append(request, tmp_path, naturalearth_lowres, ext, use
     assert len(read_dataframe(filename)) == 354
 
 
+def test_write_dataframe_append_new_fields(tmp_path):
+    """Appending matches columns to the layer by name (not position) and can
+    add declared new nullable columns to the layer."""
+    filename = tmp_path / "test.gpkg"
+    df = pd.DataFrame({"a": [1, 2], "b": [1.5, 2.5]})
+    write_dataframe(df, filename, use_arrow=False)
+
+    # append a batch with a different column order and a declared new column
+    df_append = pd.DataFrame({"c": ["x"], "b": [3.5], "a": [3]})
+    write_dataframe(
+        df_append, filename, append=True, new_fields=["c"], use_arrow=False
+    )
+
+    result = read_dataframe(filename)
+    assert result["a"].tolist() == [1, 2, 3]
+    assert result["b"].tolist() == [1.5, 2.5, 3.5]
+    assert result["c"].tolist()[:2] == [None, None]
+    assert result["c"].tolist()[2] == "x"
+
+
+def test_write_dataframe_append_new_fields_use_arrow_unsupported(tmp_path):
+    """new_fields is not supported in combination with use_arrow=True."""
+    filename = tmp_path / "test.gpkg"
+    df = pd.DataFrame({"a": [1]})
+    write_dataframe(df, filename, use_arrow=False)
+
+    with pytest.raises(NotImplementedError, match="use_arrow"):
+        write_dataframe(
+            df, filename, append=True, new_fields=["b"], use_arrow=True
+        )
+
+
 @pytest.mark.parametrize("spatial_index", [False, True])
 @pytest.mark.requires_arrow_write_api
 def test_write_dataframe_gdal_options(

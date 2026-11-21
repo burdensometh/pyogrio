@@ -2,6 +2,20 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   When appending to an existing layer (`append=True`), fields are now matched
+    to the layer definition by name instead of by position, so a different
+    column order in the data being appended no longer corrupts the data.
+    Incoming field types are converted to the types of the existing fields
+    where this can be done without loss of data; unknown, ambiguous, or
+    incompatible fields raise an error. Fields in the incoming data that are
+    declared in the new `new_fields` parameter are added to the layer as new
+    nullable columns (schema evolution) for drivers that support it, with
+    existing records keeping NULL values. For drivers with transaction
+    support, schema changes and appended records are now rolled back together
+    if writing fails partway through.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

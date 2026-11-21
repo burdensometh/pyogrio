@@ -404,8 +404,26 @@ for details about the capabilities of a driver for your version of GDAL.
 >>> write_dataframe(df, "/tmp/existing_file.gpkg", append=True)
 ```
 
-NOTE: the data structure of the data frame you are appending to the existing
-data source must exactly match the structure of the existing data source.
+When appending, the columns of the data frame are matched to the fields of
+the existing layer by name, so the column order does not need to match the
+order of the fields in the existing layer. Column types are converted to the
+types of the existing fields where this can be done safely (without loss of
+data); columns that cannot be converted safely raise an error.
+
+Columns that do not exist in the existing layer raise an error, unless they
+are declared in `new_fields`, in which case they are added to the layer as
+new nullable columns (for drivers that support adding fields to an existing
+layer). Records already present in the layer will have NULL values for the
+new columns:
+
+```
+>>> write_dataframe(df, "/tmp/existing_file.gpkg", append=True,
+...                 new_fields=["new_column"])
+```
+
+For drivers with transaction support (e.g. GeoPackage), schema changes and
+appended records are rolled back together if writing fails partway through,
+restoring the original schema and data of the layer.
 
 NOTE: not all drivers that support write capabilities support append
 capabilities for a given GDAL version.

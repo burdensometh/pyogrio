@@ -19,7 +19,7 @@ from pyogrio import (
     set_gdal_config_options,
 )
 from pyogrio._compat import GDAL_GE_37, GDAL_GE_313, HAS_PYARROW, HAS_SHAPELY
-from pyogrio.errors import DataLayerError, DataSourceError, FeatureError
+from pyogrio.errors import DataLayerError, DataSourceError, FeatureError, FieldError
 from pyogrio.raw import open_arrow, read, write
 from pyogrio.tests.conftest import (
     DRIVER_EXT,
@@ -740,6 +740,554 @@ def test_write_append_unsupported(tmp_path, naturalearth_lowres, driver, ext):
 
     with pytest.raises(DataSourceError):
         write(filename, geometry, field_data, driver=driver, append=True, **meta)
+
+
+# Point(0, 0) and Point(1, 1) as WKB
+POINT_0_0_WKB = bytes.fromhex("010100000000000000000000000000000000000000")
+POINT_1_1_WKB = bytes.fromhex("0101000000000000000000F03F000000000000F03F")
+
+
+def create_append_test_file(filename, field_data, fields, n_records=2):
+    """Create a point test file to use in append tests."""
+    geometry = np.array([POINT_0_0_WKB, POINT_1_1_WKB][:n_records], dtype=object)
+    write(
+        filename,
+        geometry,
+        field_data,
+        fields,
+        geometry_type="Point",
+        crs="EPSG:4326",
+    )
+
+
+def append_to_test_file(filename, field_data, fields, n_records=1, **kwargs):
+    """Append records to a point test file."""
+    geometry = np.array([POINT_0_0_WKB] * n_records, dtype=object)
+    write(
+        filename,
+        geometry,
+        field_data,
+        fields,
+        geometry_type="Point",
+        crs="EPSG:4326",
+        append=True,
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize("ext", [".gpkg", ".shp", ".fgb", ".geojson"])
+def test_write_append_different_field_order(tmp_path, ext):
+    """Fields of an appended batch are matched to the layer by name, so a
+    different column order in the batch does not corrupt the data."""
+    filename = tmp_path / f"test{ext}"
+    create_append_test_file(
+        filename,
+        [
+            np.array([1, 2], dtype="int32"),
+            np.array([0.5, 1.5], dtype="float64"),
+            np.array(["a", "b"], dtype=object),
+        ],
+        ["int_col", "float_col", "str_col"],
+    )
+
+    # append a batch with the fields in a different order
+    append_to_test_file(
+        filename,
+        [
+            np.array(["c"], dtype=object),
+            np.array([3], dtype="int32"),
+            np.array([2.5], dtype="float64"),
+        ],
+        ["str_col", "int_col", "float_col"],
+    )
+
+    meta, _, _, field_data = read(filename)
+    idx = {name: i for i, name in enumerate(meta["fields"])}
+
+    assert meta["dtypes"][idx["int_col"]] == "int32"
+
+    # compare per record (the read order can differ from the write order for
+    # some drivers, e.g. FlatGeobuf)
+    by_int_col = {
+        int(v): (f, s)
+        for v, f, s in zip(
+            field_data[idx["int_col"]],
+            field_data[idx["float_col"]],
+            field_data[idx["str_col"]],
+        )
+    }
+    assert by_int_col == {1: (0.5, "a"), 2: (1.5, "b"), 3: (2.5, "c")}
+
+
+def test_write_append_subset_of_fields(tmp_path):
+    """Appending a batch that only contains a subset of the fields of the
+    layer leaves the other fields NULL for the new records."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename,
+        [np.array([1, 2], dtype="int32"), np.array(["a", "b"], dtype=object)],
+        ["int_col", "str_col"],
+    )
+
+    append_to_test_file(filename, [np.array([3], dtype="int32")], ["int_col"])
+
+    meta, _, _, field_data = read(filename)
+    idx = {name: i for i, name in enumerate(meta["fields"])}
+    assert array_equal(field_data[idx["int_col"]], [1, 2, 3])
+    assert array_equal(field_data[idx["str_col"]], ["a", "b", None])
+
+
+def test_write_append_unknown_field_raises(tmp_path):
+    """Fields that do not exist in the layer and are not declared in
+    new_fields raise an error instead of being written by position."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    with pytest.raises(FieldError, match="does not exist in the target layer"):
+        append_to_test_file(
+            filename, [np.array([3], dtype="int32")], ["other_col"]
+        )
+
+    # the layer is unchanged
+    info = read_info(filename)
+    assert info["features"] == 2
+    assert info["fields"].tolist() == ["int_col"]
+
+
+def test_write_append_duplicate_field_names_raises(tmp_path):
+    """Duplicate field names in the appended batch are ambiguous."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    with pytest.raises(FieldError, match="duplicate field names"):
+        append_to_test_file(
+            filename,
+            [np.array([3], dtype="int32"), np.array([4], dtype="int32")],
+            ["int_col", "int_col"],
+        )
+
+
+def test_write_append_ambiguous_field_name_raises(tmp_path):
+    """A field name that matches multiple fields of the layer (case
+    insensitively) raises an error instead of picking one."""
+    filename = tmp_path / "test.geojson"
+    create_append_test_file(
+        filename,
+        [np.array([1, 2], dtype="int32"), np.array([3, 4], dtype="int32")],
+        ["pop", "POP"],
+    )
+    assert read_info(filename)["fields"].tolist() == ["pop", "POP"]
+
+    with pytest.raises(FieldError, match="matches multiple fields"):
+        append_to_test_file(filename, [np.array([5], dtype="int32")], ["Pop"])
+
+    # exact matches are not ambiguous
+    append_to_test_file(filename, [np.array([5], dtype="int32")], ["POP"])
+    meta, _, _, field_data = read(filename)
+    idx = {name: i for i, name in enumerate(meta["fields"])}
+    assert array_equal(field_data[idx["POP"]], [3, 4, 5])
+
+
+def test_write_append_case_insensitive_field_match(tmp_path):
+    """Field names that only differ in case from the layer definition are
+    matched (mirroring OGR field name resolution)."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    append_to_test_file(filename, [np.array([3], dtype="int32")], ["INT_COL"])
+
+    meta, _, _, field_data = read(filename)
+    assert meta["fields"].tolist() == ["int_col"]
+    assert array_equal(field_data[0], [1, 2, 3])
+
+
+@pytest.mark.parametrize("ext", [".gpkg", ".fgb", ".geojson"])
+def test_write_append_new_fields(tmp_path, ext):
+    """Fields declared in new_fields are added to the layer as new nullable
+    columns; existing records keep NULL values for those columns."""
+    filename = tmp_path / f"test{ext}"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    # append a batch with two new columns (one declared out of order with
+    # respect to the layer), only one of which already exists
+    append_to_test_file(
+        filename,
+        [np.array([10], dtype="int64"), np.array([3], dtype="int32")],
+        ["new_int", "int_col"],
+        new_fields=["new_int"],
+    )
+    append_to_test_file(
+        filename,
+        [np.array([4.5], dtype="float64"), np.array(["x"], dtype=object)],
+        ["new_float", "new_str"],
+        new_fields=["new_float", "new_str"],
+    )
+
+    info = read_info(filename)
+    fields = info["fields"].tolist()
+    assert set(fields) == {"int_col", "new_int", "new_float", "new_str"}
+    idx = {name: i for i, name in enumerate(fields)}
+    # GeoJSON narrows integer fields to int32 when the values fit
+    assert info["dtypes"][idx["new_int"]] == (
+        "int32" if ext == ".geojson" else "int64"
+    )
+    assert info["dtypes"][idx["new_float"]] == "float64"
+
+    meta, _, _, field_data = read(filename)
+    idx = {name: i for i, name in enumerate(meta["fields"])}
+
+    # existing records have NULL for the new columns (integer columns with
+    # NULLs are promoted to float64 with NaN when reading); compare order
+    # independently because the read order can differ from the write order
+    # for some drivers (e.g. FlatGeobuf)
+    new_int = field_data[idx["new_int"]]
+    assert np.isnan(new_int).sum() == 3
+    assert np.nansum(new_int) == 10
+
+    new_float = field_data[idx["new_float"]]
+    assert np.isnan(new_float).sum() == 3
+    assert np.nansum(new_float) == 4.5
+
+    new_str = field_data[idx["new_str"]]
+    assert sum(v is None for v in new_str) == 3
+    assert [v for v in new_str if v is not None] == ["x"]
+
+    # the pre-existing column is untouched; the record appended without it
+    # has NULL (read back as NaN)
+    int_col = field_data[idx["int_col"]]
+    assert np.isnan(int_col).sum() == 1
+    assert np.nansum(int_col) == 6
+
+
+def test_write_append_new_fields_undeclared_raises(tmp_path):
+    """Fields not present in the layer and not declared in new_fields raise
+    an error and leave the layer unchanged."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    with pytest.raises(FieldError, match="pass it in 'new_fields'"):
+        append_to_test_file(
+            filename,
+            [np.array([3], dtype="int32"), np.array([10], dtype="int64")],
+            ["int_col", "new_int"],
+        )
+
+    info = read_info(filename)
+    assert info["features"] == 2
+    assert info["fields"].tolist() == ["int_col"]
+
+
+def test_write_append_new_fields_unsupported_driver(tmp_path):
+    """Adding new fields to a layer fails loudly for drivers that do not
+    support it."""
+    filename = tmp_path / "test.gmt"
+    try:
+        create_append_test_file(
+            filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+        )
+    except Exception:
+        pytest.skip("GMT driver not available")
+
+    with pytest.raises((DataSourceError, FieldError)):
+        append_to_test_file(
+            filename,
+            [np.array([3], dtype="int32"), np.array([10], dtype="int64")],
+            ["int_col", "new_int"],
+            new_fields=["new_int"],
+        )
+
+
+def test_write_append_new_fields_requires_append(tmp_path):
+    """new_fields is only valid in combination with append=True."""
+    filename = tmp_path / "test.gpkg"
+    with pytest.raises(
+        ValueError, match="'new_fields' is only supported when append=True"
+    ):
+        write(
+            filename,
+            np.array([POINT_0_0_WKB], dtype=object),
+            [np.array([1], dtype="int32")],
+            ["int_col"],
+            geometry_type="Point",
+            crs="EPSG:4326",
+            new_fields=["int_col"],
+        )
+
+
+def test_write_append_new_fields_not_in_data_raises(tmp_path):
+    """Fields declared in new_fields must be present in the appended data."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    with pytest.raises(ValueError, match="not in the data being appended"):
+        append_to_test_file(
+            filename,
+            [np.array([3], dtype="int32")],
+            ["int_col"],
+            new_fields=["other_col"],
+        )
+
+
+def test_write_append_safe_type_conversions(tmp_path):
+    """Non-lossy type conversions are applied when appending."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename,
+        [
+            np.array([1, 2], dtype="int64"),
+            np.array([0.5, 1.5], dtype="float64"),
+            np.array([True, False], dtype="bool"),
+            np.array(
+                ["2020-01-01", "2020-01-02"], dtype="datetime64[ms]"
+            ),
+        ],
+        ["int_col", "float_col", "bool_col", "datetime_col"],
+    )
+
+    append_to_test_file(
+        filename,
+        [
+            # int32 -> int64
+            np.array([3], dtype="int32"),
+            # int32 -> float64
+            np.array([4], dtype="int32"),
+            # bool -> bool
+            np.array([True], dtype="bool"),
+            # datetime64[D] -> datetime64[ms]
+            np.array(["2020-01-03"], dtype="datetime64[D]"),
+        ],
+        ["int_col", "float_col", "bool_col", "datetime_col"],
+    )
+
+    info = read_info(filename)
+    idx = {name: i for i, name in enumerate(info["fields"])}
+    # the layer definition keeps the original types
+    assert info["dtypes"][idx["int_col"]] == "int64"
+    assert info["dtypes"][idx["float_col"]] == "float64"
+
+    meta, _, _, field_data = read(filename)
+    idx = {name: i for i, name in enumerate(meta["fields"])}
+    assert array_equal(field_data[idx["int_col"]], [1, 2, 3])
+    assert array_equal(field_data[idx["float_col"]], [0.5, 1.5, 4.0])
+    assert array_equal(field_data[idx["bool_col"]], [True, False, True])
+    assert array_equal(
+        field_data[idx["datetime_col"]].astype("datetime64[D]"),
+        np.array(["2020-01-01", "2020-01-02", "2020-01-03"], dtype="datetime64[D]"),
+    )
+
+
+def test_write_append_value_checked_narrowing(tmp_path):
+    """Narrowing conversions are applied if the actual values fit."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    # int64 values that fit in int32 are converted
+    append_to_test_file(filename, [np.array([3], dtype="int64")], ["int_col"])
+    # float64 values that are integral and in range are converted
+    append_to_test_file(filename, [np.array([4.0], dtype="float64")], ["int_col"])
+
+    meta, _, _, field_data = read(filename)
+    assert meta["dtypes"][0] == "int32"
+    assert array_equal(field_data[0], [1, 2, 3, 4])
+
+
+@pytest.mark.parametrize(
+    "values,dtype,field_dtype",
+    [
+        # int64 value out of int32 range
+        ([2**40], "int64", "int32"),
+        # non-integral float to integer
+        ([1.5], "float64", "int32"),
+        # infinite float to integer
+        ([np.inf], "float64", "int32"),
+        # int64 value not exactly representable as float64
+        ([2**53 + 1], "int64", "float64"),
+        # strings are not converted to numbers
+        (["1"], object, "int32"),
+    ],
+)
+def test_write_append_unsafe_type_conversion_raises(
+    tmp_path, values, dtype, field_dtype
+):
+    """Conversions that would lose data raise an error instead of writing
+    incorrect values."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype=field_dtype)], ["col"]
+    )
+
+    with pytest.raises(FieldError, match="Cannot safely convert field 'col'"):
+        append_to_test_file(filename, [np.array(values, dtype=dtype)], ["col"])
+
+    # nothing was written
+    assert read_info(filename)["features"] == 2
+
+
+def test_write_append_unsafe_float_narrowing_raises(tmp_path):
+    """float64 values that are not exactly representable as float32 raise an
+    error when appending to a float32 field."""
+    filename = tmp_path / "test.fgb"
+    create_append_test_file(
+        filename, [np.array([0.5, 1.5], dtype="float32")], ["col"]
+    )
+    assert read_info(filename)["dtypes"].tolist() == ["float32"]
+
+    with pytest.raises(FieldError, match="Cannot safely convert field 'col'"):
+        append_to_test_file(filename, [np.array([0.1], dtype="float64")], ["col"])
+
+    # exactly representable values can be appended
+    append_to_test_file(filename, [np.array([2.5], dtype="float64")], ["col"])
+    meta, _, _, field_data = read(filename)
+    assert array_equal(
+        np.sort(field_data[0]), np.array([0.5, 1.5, 2.5], dtype="float32")
+    )
+
+
+def test_write_append_unsafe_datetime_conversion_raises(tmp_path):
+    """Appending sub-day precision datetimes to a date field raises an
+    error."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename,
+        [np.array(["2020-01-01", "2020-01-02"], dtype="datetime64[D]")],
+        ["date_col"],
+    )
+
+    with pytest.raises(FieldError, match="Cannot safely convert field 'date_col'"):
+        append_to_test_file(
+            filename,
+            [np.array(["2020-01-03"], dtype="datetime64[ms]")],
+            ["date_col"],
+        )
+
+
+def test_write_append_float_nan_to_int_field(tmp_path):
+    """NaN values are written as NULL when appending float data to an integer
+    field with nan_as_null=True; with nan_as_null=False this raises an
+    error."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int64")], ["int_col"]
+    )
+
+    append_to_test_file(
+        filename,
+        [np.array([3.0, np.nan], dtype="float64")],
+        ["int_col"],
+        n_records=2,
+    )
+
+    meta, _, _, field_data = read(filename)
+    # integer column with NULLs is promoted to float64 with NaN when reading
+    assert array_equal(field_data[0][:3], [1, 2, 3])
+    assert np.isnan(field_data[0][3])
+
+    with pytest.raises(FieldError, match="Cannot safely convert field 'int_col'"):
+        append_to_test_file(
+            filename,
+            [np.array([np.nan], dtype="float64")],
+            ["int_col"],
+            nan_as_null=False,
+        )
+
+
+def test_write_append_conversion_with_mask(tmp_path):
+    """Masked (NULL) values are excluded from the value checks of narrowing
+    conversions."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    # the second value would not fit in int32, but it is masked (NULL)
+    append_to_test_file(
+        filename,
+        [np.array([3, 2**40], dtype="int64")],
+        ["int_col"],
+        n_records=2,
+        field_mask=[np.array([False, True])],
+    )
+
+    meta, _, _, field_data = read(filename)
+    assert array_equal(field_data[0][:3], [1, 2, 3])
+    assert np.isnan(field_data[0][3])
+
+
+def test_write_append_transaction_rollback(tmp_path):
+    """A failure partway through appending rolls back both the schema changes
+    and the records written so far (for drivers with transaction support)."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    # the second record has a corrupt (truncated) WKB geometry, so writing
+    # fails after the first record and after the new field was added
+    geometry = np.array(
+        [POINT_0_0_WKB, b"\x01\x01\x00\x00", POINT_1_1_WKB], dtype=object
+    )
+    with pytest.raises(Exception, match="geometry"):
+        write(
+            filename,
+            geometry,
+            [np.array([3, 4, 5], dtype="int32"), np.array([10, 11, 12], dtype="int64")],
+            ["int_col", "new_int"],
+            geometry_type="Point",
+            crs="EPSG:4326",
+            append=True,
+            new_fields=["new_int"],
+        )
+
+    # the original schema and data are restored
+    info = read_info(filename)
+    assert info["fields"].tolist() == ["int_col"]
+    assert info["features"] == 2
+
+    meta, _, _, field_data = read(filename)
+    assert array_equal(field_data[0], [1, 2])
+
+    # the layer is still usable afterwards
+    append_to_test_file(
+        filename,
+        [np.array([3], dtype="int32"), np.array([10], dtype="int64")],
+        ["int_col", "new_int"],
+        new_fields=["new_int"],
+    )
+    info = read_info(filename)
+    assert info["fields"].tolist() == ["int_col", "new_int"]
+    assert info["features"] == 3
+
+
+def test_write_append_geometry_only(tmp_path):
+    """Appending only geometries to an existing layer."""
+    filename = tmp_path / "test.gpkg"
+    create_append_test_file(
+        filename, [np.array([1, 2], dtype="int32")], ["int_col"]
+    )
+
+    append_to_test_file(filename, None, None)
+
+    info = read_info(filename)
+    assert info["features"] == 3
+    meta, _, _, field_data = read(filename)
+    assert array_equal(field_data[0][:2], [1, 2])
+    assert np.isnan(field_data[0][2])
+
+
 
 
 @pytest.mark.parametrize(

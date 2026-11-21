@@ -160,13 +160,20 @@ cdef int commit_transaction(OGRDataSourceH ogr_dataset) except 1:
     return 0
 
 
-# Not currently used; uncomment when used
-# cdef int rollback_transaction(OGRDataSourceH ogr_dataset) except 1:
-#     cdef int err = GDALDatasetRollbackTransaction(ogr_dataset)
-#     if err == OGRERR_FAILURE:
-#         raise DataSourceError("Failed to rollback transaction")
+cdef int rollback_transaction(OGRDataSourceH ogr_dataset) except 1:
+    """Roll back a transaction on the dataset.
 
-#     return 0
+    Parameters
+    ----------
+    ogr_dataset : pointer
+        The open OGR dataset
+
+    """
+    cdef int err = GDALDatasetRollbackTransaction(ogr_dataset)
+    if err == OGRERR_FAILURE:
+        raise DataSourceError("Failed to rollback transaction")
+
+    return 0
 
 
 cdef char** dict_to_options(object values):
@@ -2897,6 +2904,370 @@ cdef create_ogr_dataset_layer(
     return create_layer
 
 
+# OGR field types that can be written by ogr_write and are thus valid targets
+# when appending to an existing layer
+WRITABLE_OGR_FIELD_TYPES = {
+    OFTInteger,
+    OFTInteger64,
+    OFTReal,
+    OFTString,
+    OFTDate,
+    OFTDateTime,
+}
+
+
+cdef convert_append_field(
+    str name,
+    object values,
+    object mask,
+    bint nan_as_null,
+    int target_ogr_type,
+    str target_np_type,
+):
+    """Convert an incoming data array to the numpy dtype of the target field.
+
+    Only non-lossy conversions are applied; anything else raises a FieldError
+    so that values cannot silently be written incorrectly.  Conversions that
+    are safe for any value of the source dtype (e.g. int32 to int64) are
+    applied directly; conversions that are only safe for some values (e.g.
+    int64 to int32) are checked against the actual values, excluding nulls.
+
+    Parameters
+    ----------
+    name : str
+        Name of the field (used in error messages)
+    values : ndarray
+        The incoming data for the field
+    mask : ndarray or None
+        Mask indicating null values in `values` (excluded from checks)
+    nan_as_null : bool
+        Whether NaN values in floating point data are written as null
+    target_ogr_type : int
+        The OGR field type of the field in the existing layer
+    target_np_type : str
+        The numpy dtype name pyogrio uses for the target field
+
+    Returns
+    -------
+    (values, mask) : (ndarray, ndarray or None)
+        The data converted to the numpy dtype of the target field (may be
+        the input array if no conversion is needed) and the null mask to
+        use for the data (extended with NaN positions if NaN values are
+        written as null and the target field cannot hold NaN)
+
+    """
+    cdef str src_kind
+    cdef str target_kind
+
+    src_dtype = values.dtype
+
+    # datetime64 values of any precision can be written to a datetime field;
+    # sub-millisecond precision is truncated by the write loop, the same as
+    # when creating a new layer
+    if target_ogr_type == OFTDateTime and src_dtype.kind == "M":
+        if src_dtype == np.dtype("datetime64[ms]"):
+            return values, mask
+
+        return values.astype("datetime64[ms]"), mask
+
+    # date fields require day-precision datetime values
+    if target_ogr_type == OFTDate:
+        if src_dtype == np.dtype("datetime64[D]"):
+            return values, mask
+
+        raise FieldError(
+            f"Cannot safely convert field '{name}' from {src_dtype} to "
+            f"{target_np_type} of the target layer; convert the data to "
+            "datetime64[D] explicitly before appending"
+        )
+
+    # string fields accept values of any dtype; non-string values are
+    # converted to strings by the write loop
+    if target_ogr_type == OFTString:
+        return values, mask
+
+    target_dtype = np.dtype(target_np_type)
+    if src_dtype == target_dtype:
+        return values, mask
+
+    src_kind = src_dtype.kind
+    target_kind = target_dtype.kind
+
+    if src_kind in "iu" and target_kind == "f":
+        # integer to float: exact for all values of the source dtype only if
+        # the mantissa of the target dtype can hold it (numpy >= 2 considers
+        # any int to float cast "safe", so can_cast cannot be relied on here)
+        mantissa_bits = {"float16": 11, "float32": 24, "float64": 53}.get(
+            target_dtype.name
+        )
+        src_bits = src_dtype.itemsize * 8 - (0 if src_kind == "u" else 1)
+        if mantissa_bits is not None and src_bits <= mantissa_bits:
+            return values.astype(target_dtype), mask
+
+    elif np.can_cast(src_dtype, target_dtype, casting="safe"):
+        return values.astype(target_dtype), mask
+
+    # The remaining conversions are only safe for some values of the source
+    # dtype: check the actual values (excluding nulls) and only convert if
+    # none of them lose information
+    if mask is not None:
+        check = ~mask
+    else:
+        check = np.ones(len(values), dtype=bool)
+
+    if src_kind == "f" and nan_as_null:
+        # NaN values are written as null, so they convert to any target type
+        check &= ~np.isnan(values)
+
+    valid = values[check]
+    n_valid = len(valid)
+
+    if src_kind in "iu" and target_kind in "iu":
+        # narrower or differently-signed integer: values must fit the target
+        info = np.iinfo(target_dtype)
+        if n_valid == 0 or (valid.min() >= info.min and valid.max() <= info.max):
+            return values.astype(target_dtype), mask
+
+    elif src_kind in "iu" and target_kind == "f":
+        # integer to float: values must be exactly representable
+        converted = values.astype(target_dtype)
+        if n_valid == 0 or (converted[check].astype(src_dtype) == valid).all():
+            return converted, mask
+
+    elif src_kind == "f" and target_kind in "iu":
+        # float to integer: values must be finite, integral, and in range
+        info = np.iinfo(target_dtype)
+        # bound is exclusive: one more than the max exactly representable
+        # value (a power of two, exactly representable as float64)
+        max_excl = 2.0 ** (info.bits - 1) if info.kind == "i" else 2.0 ** info.bits
+        if n_valid == 0 or (
+            np.isfinite(valid).all()
+            and (valid == np.trunc(valid)).all()
+            and valid.min() >= info.min
+            and valid.max() < max_excl
+        ):
+            with np.errstate(invalid="ignore"):
+                converted = values.astype(target_dtype)
+
+            if nan_as_null and np.isnan(values).any():
+                # NaN does not survive the cast to an integer dtype; route
+                # those positions through the null mask instead
+                nan_mask = np.isnan(values)
+                mask = nan_mask if mask is None else mask | nan_mask
+
+            return converted, mask
+
+    elif src_kind == "f" and target_kind == "f":
+        # float to narrower float: values must round-trip exactly
+        # (NaN and inf convert exactly)
+        converted = values.astype(target_dtype)
+        roundtripped = converted[check].astype(src_dtype)
+        if n_valid == 0 or (
+            (roundtripped == valid) | (np.isnan(roundtripped) & np.isnan(valid))
+        ).all():
+            return converted, mask
+
+    raise FieldError(
+        f"Cannot safely convert field '{name}' from {src_dtype} to "
+        f"{target_dtype} of the target layer; the data contains values that "
+        "cannot be converted without loss, convert the data explicitly "
+        "before appending"
+    )
+
+
+cdef resolve_append_fields(
+    OGRLayerH ogr_layer,
+    str encoding,
+    list fields,
+    list field_data,
+    list field_mask,
+    object field_types,
+    object new_fields,
+    bint nan_as_null,
+):
+    """Match incoming fields to the fields of an existing layer by name.
+
+    The layer definition of the target layer is read to determine the field
+    mapping and safe type conversions, so that appending data never depends
+    on the column order of the incoming data.  Fields in the incoming data
+    that are declared in `new_fields` are added to the layer as new nullable
+    columns (schema evolution) if the driver supports it; existing records
+    keep NULL values for those columns.
+
+    Parameters
+    ----------
+    ogr_layer : OGRLayerH
+        The open OGR layer to append to
+    encoding : str
+        Encoding to use for field names
+    fields : list of str
+        Names of the incoming fields
+    field_data : list of ndarray
+        The incoming data, one array per field; converted in place where a
+        safe type conversion to the target field type is needed
+    field_mask : list of ndarray or None
+        The null mask per field; updated in place where a type conversion
+        requires it
+    field_types : ndarray (n, 4)
+        OGR field types inferred from the incoming data, as returned by
+        infer_field_types
+    new_fields : list of str or None
+        Names of incoming fields that may be added to the layer as new
+        nullable columns if they do not exist yet
+    nan_as_null : bool
+        Whether NaN values in floating point data are written as null
+
+    Returns
+    -------
+    (field_indexes, field_ogr_types) : (list of int, list of int)
+        The index and OGR field type in the target layer for each incoming
+        field, in the order of `fields`
+
+    """
+    cdef OGRFeatureDefnH ogr_featuredef = NULL
+    cdef OGRFieldDefnH ogr_fielddef = NULL
+    cdef int field_index
+
+    if fields is None:
+        fields = []
+
+    declared_new = set(new_fields or [])
+    not_in_data = declared_new - set(fields)
+    if not_in_data:
+        raise ValueError(
+            f"new_fields contains fields that are not in the data being "
+            f"appended: {sorted(not_in_data)}"
+        )
+
+    # read the field definition of the target layer; use_arrow=True so that
+    # fields of unsupported types are included (they raise a proper error
+    # below instead of silently being treated as unknown fields)
+    target_fields = get_fields(ogr_layer, encoding, use_arrow=True)
+
+    # map field names to their definition, detecting duplicate names in the
+    # target layer (ambiguous to write to)
+    target_by_name = {}
+    ambiguous_names = set()
+    for target_field in target_fields:
+        target_name = target_field[2]
+        if target_name in target_by_name:
+            ambiguous_names.add(target_name)
+        else:
+            target_by_name[target_name] = target_field
+
+    # incoming field names must be unique to be matched unambiguously
+    if len(set(fields)) != len(fields):
+        duplicates = sorted({name for name in fields if fields.count(name) > 1})
+        raise FieldError(
+            f"Cannot append data with duplicate field names: {duplicates}"
+        )
+
+    field_indexes = []
+    field_ogr_types = []
+    create_indexes = []
+
+    for i in range(len(fields)):
+        name = fields[i]
+        target_field = target_by_name.get(name)
+
+        if target_field is not None and name in ambiguous_names:
+            raise FieldError(
+                f"Cannot append to field '{name}': the target layer contains "
+                "multiple fields with this name"
+            )
+
+        if target_field is None:
+            # fall back to a case-insensitive match, mirroring how OGR
+            # resolves field names
+            matches = [
+                tf for tf in target_fields if tf[2].lower() == name.lower()
+            ]
+            if len(matches) > 1:
+                raise FieldError(
+                    f"Cannot append to field '{name}': it matches multiple "
+                    "fields in the target layer"
+                )
+
+            if len(matches) == 1:
+                target_field = matches[0]
+
+        if target_field is None:
+            if name not in declared_new:
+                raise FieldError(
+                    f"Field '{name}' does not exist in the target layer; pass "
+                    "it in 'new_fields' to add it as a new nullable column"
+                )
+
+            # resolved after the new field is created below
+            create_indexes.append(i)
+            field_indexes.append(-1)
+            field_ogr_types.append(field_types[i, 0])
+            continue
+
+        target_ogr_type = target_field[1]
+        target_np_type = target_field[3]
+
+        if target_ogr_type not in WRITABLE_OGR_FIELD_TYPES:
+            raise FieldError(
+                f"Cannot append to field '{name}' with unsupported OGR type "
+                f"'{FIELD_TYPE_NAMES.get(target_ogr_type, target_ogr_type)}'"
+            )
+
+        field_data[i], field_mask[i] = convert_append_field(
+            name, field_data[i], field_mask[i], nan_as_null,
+            target_ogr_type, target_np_type,
+        )
+        field_indexes.append(target_field[0])
+        field_ogr_types.append(target_ogr_type)
+
+    # schema evolution: add declared new fields as nullable columns; existing
+    # records keep NULL values for these
+    if create_indexes:
+        if not OGR_L_TestCapability(ogr_layer, OLCCreateField):
+            raise DataSourceError(
+                f"Cannot add new fields "
+                f"{[fields[i] for i in create_indexes]} to the layer: the "
+                "driver does not support adding fields to an existing layer"
+            )
+
+        for i in create_indexes:
+            field_ogr_type, field_subtype, width, _precision = field_types[i]
+
+            name_b = fields[i].encode(encoding)
+            try:
+                ogr_fielddef = check_pointer(OGR_Fld_Create(name_b, field_ogr_type))
+
+                if field_subtype != OFSTNone:
+                    OGR_Fld_SetSubType(ogr_fielddef, field_subtype)
+
+                if width:
+                    OGR_Fld_SetWidth(ogr_fielddef, width)
+
+                check_int(OGR_L_CreateField(ogr_layer, ogr_fielddef, 1))
+
+            except Exception:
+                raise FieldError(
+                    f"Error adding field '{fields[i]}' to layer"
+                ) from None
+
+            finally:
+                if ogr_fielddef != NULL:
+                    OGR_Fld_Destroy(ogr_fielddef)
+                    ogr_fielddef = NULL
+
+            # look up the index of the newly created field; fall back to the
+            # last field if the driver stores the field under a different
+            # (e.g. truncated) name
+            ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
+            field_index = OGR_FD_GetFieldIndex(ogr_featuredef, name_b)
+            if field_index < 0:
+                field_index = OGR_FD_GetFieldCount(ogr_featuredef) - 1
+
+            field_indexes[i] = field_index
+
+    return field_indexes, field_ogr_types
+
+
 # TODO: set geometry and field data as memory views?
 def ogr_write(
     object path_or_fp,
@@ -2916,7 +3287,8 @@ def ogr_write(
     bint append=False,
     dataset_metadata=None,
     layer_metadata=None,
-    gdal_tz_offsets=None
+    gdal_tz_offsets=None,
+    object new_fields=None
 ):
     """Write the data to a file."""
     cdef OGRDataSourceH ogr_dataset = NULL
@@ -2928,6 +3300,7 @@ def ogr_write(
     cdef const unsigned char *wkb_buffer = NULL
     cdef unsigned int wkbtype = 0
     cdef int supports_transactions = 0
+    cdef bint transaction_active = False
     cdef int err = 0
     cdef int i = 0
     cdef int num_records = -1
@@ -3003,10 +3376,19 @@ def ogr_write(
             # dataset capabilities / type, or from the system locale
             encoding = encoding or detect_encoding(ogr_dataset, ogr_layer)
 
-        # Create the fields
+        # Infer OGR field types from the incoming data
         field_types = None
         if num_fields > 0:
             field_types = infer_field_types([field.dtype for field in field_data])
+
+        # Wrap schema changes (creating fields on a new layer or evolving the
+        # schema of an existing layer) and writing features in a transaction
+        # where supported, so that a failure partway through writing restores
+        # the original schema and data of the layer
+        supports_transactions = OGR_L_TestCapability(ogr_layer, OLCTransactions)
+        if supports_transactions:
+            start_transaction(ogr_dataset, 0)
+            transaction_active = True
 
         if layer_created:
             for i in range(num_fields):
@@ -3037,29 +3419,40 @@ def ogr_write(
                         OGR_Fld_Destroy(ogr_fielddef)
                         ogr_fielddef = NULL
 
-        # Get the field indexes for the fields we need to write to, as they might be
-        # different than the order they were created, e.g. when using the KML driver.
-        ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
+            # Get the field indexes for the fields we need to write to, as they
+            # might be different than the order they were created, e.g. when
+            # using the KML driver.
+            ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
 
-        if OGR_FD_GetFieldCount(ogr_featuredef) == num_fields:
-            field_indexes = list(range(num_fields))
-        else:
-            for i in range(num_fields):
-                index = OGR_FD_GetFieldIndex(ogr_featuredef, fields[i].encode(encoding))
-                if index < 0:
-                    raise FieldError(
-                        f"Could not find field index for field '{fields[i]}'"
+            if OGR_FD_GetFieldCount(ogr_featuredef) == num_fields:
+                field_indexes = list(range(num_fields))
+            else:
+                for i in range(num_fields):
+                    index = OGR_FD_GetFieldIndex(
+                        ogr_featuredef, fields[i].encode(encoding)
                     )
-                field_indexes.append(index)
+                    if index < 0:
+                        raise FieldError(
+                            f"Could not find field index for field '{fields[i]}'"
+                        )
+                    field_indexes.append(index)
 
-        if field_types is not None:
-            field_ogr_types = list(field_types[:, 0])
+            if field_types is not None:
+                field_ogr_types = list(field_types[:, 0])
+
+        else:
+            if num_fields > 0 or new_fields:
+                # Appending to an existing layer: match fields to the layer
+                # definition by name (never by position), add declared new
+                # fields to the layer, and safely convert data types
+                field_indexes, field_ogr_types = resolve_append_fields(
+                    ogr_layer, encoding, fields, field_data, field_mask,
+                    field_types, new_fields, nan_as_null,
+                )
+
+            ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
 
         # Create the features
-        supports_transactions = OGR_L_TestCapability(ogr_layer, OLCTransactions)
-        if supports_transactions:
-            start_transaction(ogr_dataset, 0)
-
         for i in range(num_records):
             # create the feature
             ogr_feature = OGR_F_Create(ogr_featuredef)
@@ -3225,6 +3618,7 @@ def ogr_write(
 
         if supports_transactions:
             commit_transaction(ogr_dataset)
+            transaction_active = False
 
         log.info(f"Created {num_records:,} records")
 
@@ -3237,6 +3631,19 @@ def ogr_write(
         # copy in-memory file back to path_or_fp object
         if use_tmp_vsimem:
             read_vsimem_to_buffer(path, path_or_fp)
+
+    except Exception:
+        # roll back schema changes and any features written so far, so the
+        # original schema and data of the layer are restored (for drivers
+        # that support transactions)
+        if transaction_active:
+            transaction_active = False
+            try:
+                rollback_transaction(ogr_dataset)
+            except DataSourceError:
+                log.warning("Failed to roll back transaction", exc_info=True)
+
+        raise
 
     finally:
         # Final cleanup

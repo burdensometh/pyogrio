@@ -607,6 +607,7 @@ def write(
     promote_to_multi=None,
     nan_as_null=True,
     append=False,
+    new_fields=None,
     dataset_metadata=None,
     layer_metadata=None,
     metadata=None,
@@ -676,6 +677,20 @@ def write(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+
+        When appending, fields are matched to the existing layer by name, so
+        the order of ``fields`` does not need to match the order of the fields
+        in the existing layer.  Field types are converted to the types of the
+        existing fields where this can be done safely (without loss of data);
+        incompatible types raise an error.  Fields that do not exist in the
+        existing layer raise an error, unless they are declared in
+        ``new_fields``.
+    new_fields : list-like of str, optional (default: None)
+        Names of fields in the input data that may be added to the existing
+        layer as new nullable columns when appending (schema evolution), for
+        drivers that support adding fields to an existing layer.  Records
+        already present in the layer will have NULL values for the new
+        columns.  Only supported in combination with ``append=True``.
     dataset_metadata : dict, optional (default: None)
         Metadata to be stored at the dataset level in the output file; limited
         to drivers that support writing metadata, such as GPKG, and silently
@@ -704,6 +719,9 @@ def write(
     kwargs.pop("dtypes", None)
     kwargs.pop("ogr_types", None)
     kwargs.pop("ogr_subtypes", None)
+
+    if new_fields is not None and not append:
+        raise ValueError("'new_fields' is only supported when append=True")
 
     path, driver = _get_write_path_driver(path, driver, append=append)
 
@@ -749,6 +767,7 @@ def write(
         dataset_kwargs=dataset_kwargs,
         layer_kwargs=layer_kwargs,
         gdal_tz_offsets=gdal_tz_offsets,
+        new_fields=new_fields,
     )
 
 

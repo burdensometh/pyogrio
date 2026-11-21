@@ -535,6 +535,7 @@ def write_dataframe(
     promote_to_multi=None,
     nan_as_null=True,
     append=False,
+    new_fields=None,
     use_arrow=None,
     dataset_metadata=None,
     layer_metadata=None,
@@ -601,6 +602,21 @@ def write_dataframe(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+
+        When appending, columns are matched to the fields of the existing
+        layer by name, so the column order of ``df`` does not need to match
+        the order of the fields in the existing layer.  Column types are
+        converted to the types of the existing fields where this can be done
+        safely (without loss of data); incompatible types raise an error.
+        Columns that do not exist in the existing layer raise an error,
+        unless they are declared in ``new_fields``.
+    new_fields : list-like of str, optional (default: None)
+        Names of columns in ``df`` that may be added to the existing layer as
+        new nullable columns when appending (schema evolution), for drivers
+        that support adding fields to an existing layer.  Records already
+        present in the layer will have NULL values for the new columns.  Only
+        supported in combination with ``append=True`` and not with
+        ``use_arrow=True``.
     use_arrow : bool, optional (default: False)
         Whether to use Arrow as the transfer mechanism of the data to write
         from Python to GDAL (requires GDAL >= 3.8 and `pyarrow` to be
@@ -660,6 +676,12 @@ def write_dataframe(
 
     if use_arrow is None:
         use_arrow = bool(int(os.environ.get("PYOGRIO_USE_ARROW", "0")))
+
+    if new_fields is not None and use_arrow:
+        raise NotImplementedError(
+            "'new_fields' is not supported with use_arrow=True"
+        )
+
     path, driver = _get_write_path_driver(path, driver, append=append)
 
     geometry_columns = df.columns[df.dtypes == "geometry"]
@@ -959,6 +981,7 @@ def write_dataframe(
         promote_to_multi=promote_to_multi,
         nan_as_null=nan_as_null,
         append=append,
+        new_fields=new_fields,
         dataset_metadata=dataset_metadata,
         layer_metadata=layer_metadata,
         metadata=metadata,

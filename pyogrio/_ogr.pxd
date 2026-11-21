@@ -418,6 +418,7 @@ cdef extern from "ogr_api.h":
 
     const char*     OLCStringsAsUTF8
     const char*     OLCRandomRead
+    const char*     OLCCreateField
     const char*     OLCFastSetNextByIndex
     const char*     OLCFastSpatialFilter
     const char*     OLCFastFeatureCount
