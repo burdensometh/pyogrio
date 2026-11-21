@@ -1,12 +1,13 @@
 """Low level functions to read and write OGR data sources."""
 
+import contextlib
 import warnings
 from io import BytesIO
 from pathlib import Path
 
 from pyogrio._compat import HAS_ARROW_WRITE_API, HAS_PYARROW
 from pyogrio._env import GDALEnv
-from pyogrio.core import detect_write_driver
+from pyogrio.core import detect_write_driver, list_layers
 from pyogrio.errors import DataSourceError
 from pyogrio.util import (
     _mask_to_wkb,
@@ -468,6 +469,642 @@ def open_arrow(
         use_pyarrow=use_pyarrow,
         datetime_as_string=datetime_as_string,
     )
+
+
+#: Name of the column carrying the originating layer of each feature.
+SOURCE_LAYER_COLUMN = "source_layer"
+#: Name of the column carrying the original FID (per layer) of each feature.
+SOURCE_FID_COLUMN = "source_fid"
+#: Name of the geometry column in the combined output.
+GEOMETRY_COLUMN = "geometry"
+
+_RESERVED_COLUMNS = {SOURCE_LAYER_COLUMN, SOURCE_FID_COLUMN}
+
+
+def read_arrow_layers(
+    path_or_buffer,
+    /,
+    layers=None,
+    encoding=None,
+    columns=None,
+    read_geometry=True,
+    skip_features=0,
+    max_features=None,
+    where=None,
+    bbox=None,
+    mask=None,
+    fids=None,
+    datetime_as_string=False,
+    **kwargs,
+):
+    """Read multiple layers of an OGR data source into one pyarrow Table.
+
+    The features of the requested layers are combined into a single table, in
+    the declared order of ``layers``, so that several source layers become one
+    vector stream. Every row records the layer it came from in a
+    ``source_layer`` column and its original feature id (FID) in a
+    ``source_fid`` column. Because the source layer is part of every row,
+    features that share an FID in different layers remain distinct records.
+
+    Attribute fields with the same name across layers are aligned to a common
+    Arrow schema. Where layers disagree on the Arrow type of a shared field, the
+    types are unified using the "permissive" promotion rules of
+    :func:`pyarrow.unify_schemas` (for example ``int32`` and ``int64`` become
+    ``int64``). A field that is absent from a given layer is filled with nulls
+    for that layer's rows.
+
+    Layers without a geometry column are supported: when at least one selected
+    layer has geometry, the combined table has a single ``geometry`` column
+    whose values are null for the rows of geometry-less layers. When none of the
+    selected layers has geometry, the combined table has no geometry column.
+
+    Features are read and emitted one batch at a time; layers are never first
+    combined per layer into a single large table.
+
+    See the docstring of `read` for the shared parameters, and
+    :func:`open_arrow_layers` for the streaming equivalent.
+
+    Parameters
+    ----------
+    path_or_buffer : pathlib.Path or str, or bytes buffer
+        A dataset path or URI, raw buffer, or file-like object with a read method.
+    layers : sequence of str or int, optional (default: all layers)
+        Names or indices, in the order in which they should be read, of the
+        layers to combine. When omitted, every layer of the data source is read
+        in its declared order. Indices refer to the position of the layer in the
+        data source.
+    encoding, columns, read_geometry, skip_features, max_features, where, bbox, \
+mask, fids, datetime_as_string, **kwargs
+        See the docstring of `read` for these parameters. ``columns`` and
+        ``fids`` apply to every selected layer (FIDs are filtered per layer,
+        within each layer's own FID space). ``skip_features`` and
+        ``max_features`` apply per layer.
+
+    Returns
+    -------
+    (dict, pyarrow.Table)
+        Returns a tuple of meta information and a pyarrow Table with the
+        combined data. Meta is::
+
+            {
+                "layers": <list of layer names in read order>,
+                "geometry_name": "<geometry column name or None>",
+                "geometry_type": "<common geometry type or 'Unknown'>",
+                "crs": "<CRS shared by all spatial layers, or None>",
+                "source_layer_column": "source_layer",
+                "source_fid_column": "source_fid",
+                "fields": <list of combined attribute field names>,
+                "layer_meta": <list of per-layer meta dicts as returned by
+                               open_arrow>,
+            }
+
+    Raises
+    ------
+    ValueError
+        If the selected layers have incompatible CRS, if an attribute field
+        cannot be aligned to a common Arrow type, or if a source attribute uses
+        one of the reserved output column names.
+
+    """
+    if not HAS_PYARROW:
+        raise RuntimeError(
+            "pyarrow is required to read with 'read_arrow_layers'; use "
+            "'open_arrow_layers' to obtain a generic Arrow stream"
+        )
+
+    with open_arrow_layers(
+        path_or_buffer,
+        layers=layers,
+        encoding=encoding,
+        columns=columns,
+        read_geometry=read_geometry,
+        skip_features=skip_features,
+        max_features=max_features,
+        where=where,
+        bbox=bbox,
+        mask=mask,
+        fids=fids,
+        datetime_as_string=datetime_as_string,
+        use_pyarrow=True,
+        **kwargs,
+    ) as (meta, reader):
+        return meta, reader.read_all()
+
+
+def open_arrow_layers(
+    path_or_buffer,
+    /,
+    layers=None,
+    encoding=None,
+    columns=None,
+    read_geometry=True,
+    skip_features=0,
+    max_features=None,
+    where=None,
+    bbox=None,
+    mask=None,
+    fids=None,
+    datetime_as_string=False,
+    batch_size=65_536,
+    use_pyarrow=False,
+    **kwargs,
+):
+    """Open multiple layers of an OGR data source as one Arrow record batch stream.
+
+    The stream concatenates the features of the requested layers, in the
+    declared order of ``layers``, so that several source layers become a single
+    vector stream. Every row records its originating layer in a ``source_layer``
+    column and its original feature id in a ``source_fid`` column, so identical
+    FIDs from different layers stay distinct records.
+
+    Attribute fields that share a name across layers are aligned to a common
+    Arrow schema (see :func:`read_arrow_layers`). Geometry-less layers and
+    layers with missing fields are supported by filling the corresponding
+    values with nulls.
+
+    Layers are opened and consumed one batch at a time. Features of a layer are
+    streamed before the next layer is opened, and layers are never combined into
+    a single in-memory table.
+
+    See the docstring of :func:`read_arrow_layers` and `read` for parameters.
+
+    The returned stream reads from OGR and must not be accessed after the
+    context manager has been closed.
+
+    By default this function returns a generic stream object implementing the
+    `Arrow PyCapsule Protocol`_ (i.e. having an ``__arrow_c_stream__`` method)
+    that can be consumed by any Arrow implementation supporting that protocol.
+    Specify ``use_pyarrow=True`` to directly get a `pyarrow.RecordBatchReader`.
+
+    .. _Arrow PyCapsule Protocol: https://arrow.apache.org/docs/format/CDataInterface/PyCapsuleInterface.html
+
+    Other Parameters
+    ----------------
+    batch_size : int (default: 65_536)
+        Maximum number of features to retrieve per batch.
+    use_pyarrow : bool (default: False)
+        If True, return a pyarrow RecordBatchReader instead of a generic
+        ArrowStream object.
+
+    Returns
+    -------
+    (dict, pyarrow.RecordBatchReader or ArrowStream)
+        The same metadata as returned by `read_arrow_layers`, and a stream of
+        record batches.
+
+    Examples
+    --------
+    >>> from pyogrio.raw import open_arrow_layers
+    >>> with open_arrow_layers(path, layers=["roads", "rivers"]) as (meta, stream):
+    >>>     for batch in stream:
+    >>>         ...  # batch has "source_layer", "source_fid" and aligned fields
+
+    """
+    if not HAS_ARROW_WRITE_API:
+        raise RuntimeError("GDAL>=3.8 is required to read Arrow streams per layer")
+
+    if not HAS_PYARROW:
+        raise RuntimeError(
+            "pyarrow is required to align multiple layers to a common Arrow schema"
+        )
+
+    if skip_features < 0:
+        raise ValueError("'skip_features' must be >= 0")
+
+    if max_features is not None and max_features < 0:
+        raise ValueError("'max_features' must be >= 0")
+
+    # Normalize the input once so that file-like buffers are read only once and
+    # the same (VSI) path is reused for every layer that is opened below.
+    path_or_buffer = get_vsi_path_or_buffer(path_or_buffer)
+
+    declared = _list_layer_names(path_or_buffer)
+
+    if layers is None:
+        layer_names = declared
+    else:
+        if isinstance(layers, (str, int)) and not isinstance(layers, bool):
+            raise TypeError(
+                "'layers' must be a sequence of layer names or indices, not a "
+                f"single {type(layers).__name__}"
+            )
+        layer_names = [_resolve_layer_name(item, declared) for item in layers]
+
+    if len(layer_names) == 0:
+        raise ValueError("'layers' must contain at least one layer")
+
+    if len(set(layer_names)) != len(layer_names):
+        raise ValueError(f"Selected layers must be unique: {layer_names}")
+
+    return _open_arrow_layers(
+        path_or_buffer,
+        layer_names,
+        encoding=encoding,
+        columns=columns,
+        read_geometry=read_geometry,
+        skip_features=skip_features,
+        max_features=max_features,
+        where=where,
+        bbox=bbox,
+        mask=mask,
+        fids=fids,
+        datetime_as_string=datetime_as_string,
+        batch_size=batch_size,
+        use_pyarrow=use_pyarrow,
+        kwargs=kwargs,
+    )
+
+
+def _resolve_layer_name(layer, declared):
+    """Resolve a layer name or index to its declared layer name."""
+    if isinstance(layer, str):
+        if layer not in declared:
+            raise ValueError(
+                f"Layer {layer!r} not found in data source; available layers: "
+                f"{declared}"
+            )
+        return layer
+
+    if isinstance(layer, int) and not isinstance(layer, bool):
+        try:
+            return declared[layer]
+        except IndexError:
+            raise ValueError(
+                f"Layer index {layer} is out of range for data source with "
+                f"{len(declared)} layer(s)"
+            ) from None
+
+    raise TypeError(
+        "Each entry in 'layers' must be a layer name (str) or index (int), "
+        f"got {type(layer).__name__}"
+    )
+
+
+def _list_layer_names(path_or_buffer):
+    """Return the declared layer names of a data source, in source order."""
+    return [name for name, _geometry_type in list_layers(path_or_buffer)]
+
+
+@contextlib.contextmanager
+def _open_arrow_layers(
+    path_or_buffer,
+    layer_names,
+    *,
+    encoding,
+    columns,
+    read_geometry,
+    skip_features,
+    max_features,
+    where,
+    bbox,
+    mask,
+    fids,
+    datetime_as_string,
+    batch_size,
+    use_pyarrow,
+    kwargs,
+):
+    """Implementation of :func:`open_arrow_layers`."""
+    import pyarrow as pa
+
+    open_kwargs = {
+        "encoding": encoding,
+        "columns": columns,
+        "read_geometry": read_geometry,
+        "skip_features": skip_features,
+        "where": where,
+        "bbox": bbox,
+        "mask": mask,
+        "fids": fids,
+        "datetime_as_string": datetime_as_string,
+        "batch_size": batch_size,
+        "use_pyarrow": True,
+    }
+
+    # Inspect every layer to construct the common output schema. Only the
+    # schema is retained; the per-layer streams are closed again immediately.
+    layer_info = []
+    for layer in layer_names:
+        with open_arrow(
+            path_or_buffer, layer=layer, return_fids=True, **open_kwargs, **kwargs
+        ) as (meta, reader):
+            layer_info.append(_LayerArrowInfo(layer, meta, reader.schema))
+
+    geometry_field, geometry_type, crs = _validate_layer_geometry(layer_info)
+    attribute_fields = _unify_attribute_fields(layer_info)
+    _check_reserved_columns(attribute_fields, geometry_field)
+
+    fields = [
+        pa.field(SOURCE_LAYER_COLUMN, pa.string(), nullable=False),
+        pa.field(SOURCE_FID_COLUMN, pa.int64(), nullable=False),
+        *attribute_fields,
+    ]
+    if geometry_field is not None:
+        fields.append(geometry_field)
+
+    output_schema = pa.schema(fields)
+
+    meta = {
+        "layers": [info.name for info in layer_info],
+        "geometry_name": GEOMETRY_COLUMN if geometry_field is not None else None,
+        "geometry_type": geometry_type,
+        "crs": crs,
+        "source_layer_column": SOURCE_LAYER_COLUMN,
+        "source_fid_column": SOURCE_FID_COLUMN,
+        "fields": [field.name for field in attribute_fields],
+        "layer_meta": [info.meta for info in layer_info],
+    }
+
+    reader = pa.RecordBatchReader.from_batches(
+        output_schema,
+        _iter_aligned_batches(
+            path_or_buffer,
+            layer_info,
+            attribute_fields,
+            geometry_field,
+            output_schema,
+            open_kwargs,
+            kwargs,
+            max_features,
+        ),
+    )
+
+    try:
+        if use_pyarrow:
+            yield meta, reader
+        else:
+            yield meta, _ArrowStream(reader)
+    finally:
+        reader.close()
+
+
+class _ArrowStream:
+    """Generic Arrow stream wrapper exposing the PyCapsule protocol."""
+
+    def __init__(self, reader):
+        self._reader = reader
+
+    def __arrow_c_stream__(self, requested_schema=None):
+        if requested_schema is not None:
+            raise NotImplementedError("requested_schema is not supported")
+        return self._reader.__arrow_c_stream__()
+
+
+def _iter_aligned_batches(
+    path_or_buffer,
+    layer_info,
+    attribute_fields,
+    geometry_field,
+    output_schema,
+    open_kwargs,
+    kwargs,
+    max_features,
+):
+    """Yield batches of each layer, aligned to the common schema.
+
+    Only one layer is open and being streamed at any moment.
+    """
+    for info in layer_info:
+        with open_arrow(
+            path_or_buffer, layer=info.name, return_fids=True, **open_kwargs, **kwargs
+        ) as (_meta, reader):
+            yield from _iter_layer_batches(
+                reader,
+                info,
+                attribute_fields,
+                geometry_field,
+                output_schema,
+                max_features,
+            )
+
+
+def _iter_layer_batches(
+    reader, info, attribute_fields, geometry_field, output_schema, max_features
+):
+    emitted = 0
+    for batch in reader:
+        if max_features is not None:
+            remaining = max_features - emitted
+            if remaining <= 0:
+                break
+            if batch.num_rows > remaining:
+                batch = batch.slice(0, remaining)
+
+        emitted += batch.num_rows
+        yield _align_batch(
+            batch, info, attribute_fields, geometry_field, output_schema
+        )
+
+
+def _align_batch(batch, info, attribute_fields, geometry_field, output_schema):
+    """Align one source batch to the common output schema."""
+    import pyarrow as pa
+
+    number_of_rows = batch.num_rows
+    source_names = batch.schema.names
+
+    arrays = [
+        pa.repeat(pa.scalar(info.name, type=pa.string()), number_of_rows),
+        batch.column(info.fid_name).cast(pa.int64()),
+    ]
+
+    for field in attribute_fields:
+        if field.name in source_names and field.name not in (
+            info.geometry_name,
+            info.fid_name,
+        ):
+            arrays.append(batch.column(field.name).cast(field.type))
+        else:
+            arrays.append(pa.nulls(number_of_rows, type=field.type))
+
+    if geometry_field is not None:
+        if info.geometry_name is not None:
+            arrays.append(
+                batch.column(info.geometry_name).cast(geometry_field.type)
+            )
+        else:
+            arrays.append(pa.nulls(number_of_rows, type=geometry_field.type))
+
+    return pa.RecordBatch.from_arrays(arrays, schema=output_schema)
+
+
+class _LayerArrowInfo:
+    """Arrow schema information for one layer."""
+
+    def __init__(self, name, meta, schema):
+        self.name = name
+        self.meta = meta
+
+        geometry_field = _arrow_geometry_field(schema, meta)
+        self.geometry_name = (
+            geometry_field.name if geometry_field is not None else None
+        )
+        self._geometry_type = (
+            geometry_field.type if geometry_field is not None else None
+        )
+        self._geometry_metadata = (
+            geometry_field.metadata if geometry_field is not None else None
+        )
+
+        fid_column = meta.get("fid_column")
+        if fid_column and fid_column in schema.names:
+            self.fid_name = fid_column
+        else:
+            raise ValueError(
+                f"Layer {name!r} does not expose a feature id column; "
+                "it cannot be combined with other layers"
+            )
+
+        self.attribute_fields = [
+            field
+            for field in schema
+            if field.name not in (self.geometry_name, self.fid_name)
+        ]
+
+
+def _arrow_geometry_field(schema, meta):
+    """Return the geometry field of an Arrow schema, or None."""
+    for field in schema:
+        extension_name = (field.metadata or {}).get(b"ARROW:extension:name")
+        if extension_name in (b"geoarrow.wkb", b"ogc.wkb"):
+            return field
+
+    for name in (meta.get("geometry_name"), "wkb_geometry"):
+        if name and name in schema.names:
+            field = schema.field(name)
+            if _is_binary_type(field.type):
+                return field
+
+    return None
+
+
+def _is_binary_type(arrow_type):
+    import pyarrow as pa
+
+    return arrow_type == pa.binary() or arrow_type == pa.large_binary()
+
+
+def _check_reserved_columns(attribute_fields, geometry_field):
+    names = {field.name for field in attribute_fields}
+    reserved = _RESERVED_COLUMNS & names
+    if geometry_field is not None and GEOMETRY_COLUMN in names:
+        reserved.add(GEOMETRY_COLUMN)
+    if reserved:
+        raise ValueError(
+            "Source attribute names conflict with reserved output columns: "
+            + ", ".join(sorted(reserved))
+        )
+
+
+def _crs_key(crs):
+    """Return a normalized comparison key for a CRS value."""
+    if crs is None:
+        return None
+    return str(crs).strip()
+
+
+def _validate_layer_geometry(layer_info):
+    """Validate geometry and CRS compatibility, returning the output geometry.
+
+    Returns
+    -------
+    (geometry_field, geometry_type, crs)
+        ``geometry_field`` is the unified Arrow field for the output (or None),
+        ``geometry_type`` a name for the combined geometry type (or None) and
+        ``crs`` the CRS shared by the spatial layers (or None).
+    """
+    import pyarrow as pa
+
+    spatial = [info for info in layer_info if info.geometry_name is not None]
+
+    if not spatial:
+        return None, None, None
+
+    crs_keys = {_crs_key(info.meta.get("crs")) for info in spatial}
+    known_keys = crs_keys - {None}
+    if len(known_keys) > 1 or (known_keys and None in crs_keys):
+        detail = ", ".join(
+            f"{info.name!r}: {info.meta.get('crs')!r}" for info in spatial
+        )
+        raise ValueError("Cannot combine layers with incompatible CRS: " + detail)
+
+    crs = next(
+        (info.meta.get("crs") for info in spatial if info.meta.get("crs") is not None),
+        None,
+    )
+
+    geometry_types = {info.meta.get("geometry_type") for info in spatial}
+    if len(geometry_types) == 1:
+        geometry_type = next(iter(geometry_types))
+    else:
+        geometry_type = "Unknown"
+
+    arrow_types = [info._geometry_type for info in spatial]
+    try:
+        unified = pa.unify_schemas(
+            [pa.schema([pa.field(GEOMETRY_COLUMN, t)]) for t in arrow_types],
+            promote_options="permissive",
+        ).field(0)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+        raise ValueError(
+            "Geometry columns of the selected layers cannot be aligned to a "
+            f"common Arrow schema: {exc}"
+        ) from exc
+
+    metadata = next(
+        (info._geometry_metadata for info in spatial if info._geometry_metadata),
+        None,
+    )
+    geometry_field = pa.field(
+        GEOMETRY_COLUMN, unified.type, nullable=True, metadata=metadata
+    )
+    return geometry_field, geometry_type, crs
+
+
+def _unify_attribute_fields(layer_info):
+    """Unify the attribute fields of all layers into one ordered list of fields."""
+    import pyarrow as pa
+
+    if not any(info.attribute_fields for info in layer_info):
+        return []
+
+    try:
+        unified = pa.unify_schemas(
+            [
+                pa.schema([_nullable(field) for field in info.attribute_fields])
+                for info in layer_info
+            ],
+            promote_options="permissive",
+        )
+    except (pa.ArrowInvalid, pa.ArrowTypeError, TypeError) as exc:
+        detail = ", ".join(
+            f"{info.name!r}: {[f.name for f in info.attribute_fields]}"
+            for info in layer_info
+        )
+        raise ValueError(
+            "Attribute fields of the selected layers cannot be aligned to a "
+            f"common Arrow schema ({detail}): {exc}"
+        ) from exc
+
+    # Keep a stable column order: the order in which fields are first seen.
+    ordered = []
+    seen = set()
+    for info in layer_info:
+        for field in info.attribute_fields:
+            if field.name in seen:
+                continue
+            seen.add(field.name)
+            ordered.append(_nullable(unified.field(field.name)))
+    return ordered
+
+
+def _nullable(field):
+    """Return a copy of an Arrow field marked as nullable.
+
+    Fields that are absent from a layer are filled with nulls, so every aligned
+    field must be nullable regardless of the source schema.
+    """
+    return field.with_nullable(True)
 
 
 def _parse_options_names(xml):

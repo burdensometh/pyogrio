@@ -2,6 +2,18 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add `read_arrow_layers` and `open_arrow_layers` to combine multiple layers
+    of a data source into a single Arrow table or record batch stream, in the
+    declared order of the layers. Each row carries a `source_layer` column with
+    its originating layer and a `source_fid` column with its original feature id,
+    so identical FIDs in different layers remain distinct records. Fields with
+    the same name are aligned to a common Arrow schema, missing fields and
+    geometry-less layers are filled with nulls, and incompatible CRS are
+    rejected. Layers are streamed batch by batch and the result can be passed
+    directly to `write_arrow`.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

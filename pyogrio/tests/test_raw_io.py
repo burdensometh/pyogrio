@@ -20,7 +20,7 @@ from pyogrio import (
 )
 from pyogrio._compat import GDAL_GE_37, GDAL_GE_313, HAS_PYARROW, HAS_SHAPELY
 from pyogrio.errors import DataLayerError, DataSourceError, FeatureError
-from pyogrio.raw import open_arrow, read, write
+from pyogrio.raw import open_arrow, open_arrow_layers, read, write
 from pyogrio.tests.conftest import (
     DRIVER_EXT,
     DRIVERS,
@@ -1493,3 +1493,44 @@ def test_open_arrow_error_no_pyarrow(naturalearth_lowres):
     with pytest.raises(ImportError):
         with open_arrow(naturalearth_lowres, use_pyarrow=True) as _:
             pass
+
+
+@requires_pyarrow_api
+@pytest.mark.skipif(__gdal_version__ < (3, 8, 0), reason="Requires GDAL >= 3.8")
+def test_open_arrow_layers_capsule_stream(tmp_path):
+    """The multi-layer stream is consumable via the Arrow PyCapsule protocol."""
+    pyarrow = pytest.importorskip("pyarrow")
+
+    path = tmp_path / "multiple.gpkg"
+    point = bytes.fromhex("010100000000000000000000000000000000000000")
+    geometry = np.array([point, point], dtype=object)
+
+    write(
+        path,
+        geometry,
+        [np.array([1, 2])],
+        ["value"],
+        layer="first",
+        geometry_type="Point",
+        crs="EPSG:4326",
+    )
+    write(
+        path,
+        geometry,
+        [np.array([3, 4])],
+        ["value"],
+        layer="second",
+        geometry_type="Point",
+        crs="EPSG:4326",
+        append=True,
+    )
+
+    with open_arrow_layers(path) as (meta, stream):
+        assert hasattr(stream, "__arrow_c_stream__")
+        table = pyarrow.table(stream)
+
+    assert meta["layers"] == ["first", "second"]
+    assert table["source_layer"].to_pylist() == ["first"] * 2 + ["second"] * 2
+    # identical FIDs must not be merged across layers
+    assert table["source_fid"].to_pylist() == [1, 2, 1, 2]
+    assert table.num_rows == 4

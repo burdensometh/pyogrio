@@ -41,5 +41,7 @@ Arrow integration
 -----------------
 
 .. autofunction:: pyogrio.read_arrow
+.. autofunction:: pyogrio.read_arrow_layers
 .. autofunction:: pyogrio.open_arrow
+.. autofunction:: pyogrio.open_arrow_layers
 .. autofunction:: pyogrio.write_arrow

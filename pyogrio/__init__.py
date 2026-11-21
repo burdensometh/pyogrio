@@ -30,7 +30,13 @@ from pyogrio.core import (
     vsi_unlink,
 )
 from pyogrio.geopandas import read_dataframe, write_dataframe
-from pyogrio.raw import open_arrow, read_arrow, write_arrow
+from pyogrio.raw import (
+    open_arrow,
+    open_arrow_layers,
+    read_arrow,
+    read_arrow_layers,
+    write_arrow,
+)
 
 __version__ = get_versions()["version"]
 del get_versions
@@ -47,7 +53,9 @@ __all__ = [
     "list_drivers_details",
     "list_layers",
     "open_arrow",
+    "open_arrow_layers",
     "read_arrow",
+    "read_arrow_layers",
     "read_bounds",
     "read_dataframe",
     "read_info",

@@ -21,7 +21,14 @@ from pyogrio import (
 )
 from pyogrio._compat import HAS_PYPROJ
 from pyogrio.errors import DataLayerError, DataSourceError, FieldError
-from pyogrio.raw import open_arrow, read_arrow, write, write_arrow
+from pyogrio.raw import (
+    open_arrow,
+    open_arrow_layers,
+    read_arrow,
+    read_arrow_layers,
+    write,
+    write_arrow,
+)
 from pyogrio.tests.conftest import (
     ALL_EXTS,
     DRIVER_EXT,
@@ -1205,3 +1212,323 @@ def test_non_utf8_encoding_io_arrow_exception(tmp_path, naturalearth_lowres, ext
             geometry_name=meta["geometry_name"] or "wkb_geometry",
             encoding="CP936",
         )
+
+
+# ---------------------------------------------------------------------------
+# Reading multiple layers as a single Arrow stream
+# ---------------------------------------------------------------------------
+
+_POINT_WKB = bytes.fromhex("010100000000000000000000000000000000000000")
+
+
+def _write_layer(path, layer, fields, field_data, crs="EPSG:4326", geometry=True):
+    kwargs = {}
+    if geometry:
+        geometry_array = np.array([_POINT_WKB] * len(field_data[0]), dtype=object)
+        kwargs["geometry_type"] = "Point"
+        if crs is not None:
+            kwargs["crs"] = crs
+    else:
+        geometry_array = None
+    write(
+        path,
+        geometry_array,
+        field_data,
+        fields,
+        layer=layer,
+        append=path.exists(),
+        **kwargs,
+    )
+
+
+@pytest.fixture
+def multilayer_gpkg(tmp_path):
+    path = tmp_path / "multilayer.gpkg"
+    _write_layer(
+        path,
+        "layer_a",
+        ["shared", "only_a"],
+        [np.array([1, 2], dtype=np.int32), np.array(["x", "y"], dtype=object)],
+    )
+    _write_layer(
+        path,
+        "layer_b",
+        ["shared", "only_b"],
+        [np.array([3, 4], dtype=np.int64), np.array([1.5, 2.5])],
+    )
+    _write_layer(
+        path,
+        "layer_c",
+        ["shared"],
+        [np.array([5, 6], dtype=np.int32)],
+    )
+    return path
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers(multilayer_gpkg):
+    meta, table = read_arrow_layers(multilayer_gpkg)
+
+    assert meta["layers"] == ["layer_a", "layer_b", "layer_c"]
+    assert meta["source_layer_column"] == "source_layer"
+    assert meta["source_fid_column"] == "source_fid"
+    assert meta["geometry_name"] == "geometry"
+    assert meta["crs"] == "EPSG:4326"
+
+    assert table.column_names == [
+        "source_layer",
+        "source_fid",
+        "shared",
+        "only_a",
+        "only_b",
+        "geometry",
+    ]
+    assert table["source_layer"].to_pylist() == ["layer_a"] * 2 + ["layer_b"] * 2 + [
+        "layer_c"
+    ] * 2
+
+    # shared fields are aligned to a common type; int32 and int64 -> int64
+    assert table.schema.field("shared").type == pyarrow.int64()
+    assert table["shared"].to_pylist() == [1, 2, 3, 4, 5, 6]
+
+    # fields missing from a layer are null for that layer's rows
+    assert table["only_a"].to_pylist() == ["x", "y", None, None, None, None]
+    assert table["only_b"].to_pylist() == [None, None, 1.5, 2.5, None, None]
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_fids_are_per_layer(multilayer_gpkg):
+    """Equal FIDs in different layers must stay distinct records."""
+    meta, table = read_arrow_layers(multilayer_gpkg, layers=["layer_a", "layer_b"])
+
+    # GPKG FIDs are unique within a layer and reused across layers (1, 2)
+    fids = table["source_fid"].to_pylist()
+    assert fids == [1, 2, 1, 2]
+
+    keys = set(zip(table["source_layer"].to_pylist(), fids))
+    assert len(keys) == len(table)
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_declared_order(multilayer_gpkg):
+    meta, table = read_arrow_layers(
+        multilayer_gpkg, layers=["layer_c", "layer_a"]
+    )
+    assert meta["layers"] == ["layer_c", "layer_a"]
+    assert table["source_layer"].to_pylist() == ["layer_c"] * 2 + ["layer_a"] * 2
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_by_index(multilayer_gpkg):
+    meta, table = read_arrow_layers(multilayer_gpkg, layers=[2, 0])
+    assert meta["layers"] == ["layer_c", "layer_a"]
+    assert table["source_layer"].to_pylist() == ["layer_c"] * 2 + ["layer_a"] * 2
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_subset_columns(multilayer_gpkg):
+    meta, table = read_arrow_layers(multilayer_gpkg, columns=["shared"])
+    assert table.column_names == ["source_layer", "source_fid", "shared", "geometry"]
+    assert table["shared"].to_pylist() == [1, 2, 3, 4, 5, 6]
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_no_geometry(tmp_path):
+    path = tmp_path / "nogeom.gpkg"
+    _write_layer(
+        path, "a", ["v"], [np.array([1, 2], dtype=np.int64)], geometry=False
+    )
+    _write_layer(
+        path,
+        "b",
+        ["v", "w"],
+        [np.array([3, 4], dtype=np.int64), np.array([True, False])],
+        geometry=False,
+    )
+
+    meta, table = read_arrow_layers(path)
+
+    assert meta["geometry_name"] is None
+    assert meta["geometry_type"] is None
+    assert meta["crs"] is None
+    assert table.column_names == ["source_layer", "source_fid", "v", "w"]
+    assert table["v"].to_pylist() == [1, 2, 3, 4]
+    assert table["w"].to_pylist() == [None, None, True, False]
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_mixed_geometry_and_nongeometry(tmp_path):
+    path = tmp_path / "mixed.gpkg"
+    _write_layer(path, "spatial", ["v"], [np.array([1, 2], dtype=np.int64)])
+    _write_layer(
+        path, "tabular", ["v"], [np.array([3, 4], dtype=np.int64)], geometry=False
+    )
+
+    meta, table = read_arrow_layers(path)
+
+    assert meta["geometry_name"] == "geometry"
+    assert table["geometry"].to_pylist()[:2] == [_POINT_WKB, _POINT_WKB]
+    assert table["geometry"].to_pylist()[2:] == [None, None]
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_incompatible_crs(tmp_path):
+    path = tmp_path / "crs.gpkg"
+    _write_layer(
+        path, "a", ["v"], [np.array([1, 2], dtype=np.int64)], crs="EPSG:4326"
+    )
+    _write_layer(
+        path, "b", ["v"], [np.array([3, 4], dtype=np.int64)], crs="EPSG:3857"
+    )
+
+    with pytest.raises(ValueError, match="incompatible CRS"):
+        read_arrow_layers(path)
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_missing_crs(tmp_path):
+    path = tmp_path / "crs.gpkg"
+    _write_layer(
+        path, "a", ["v"], [np.array([1, 2], dtype=np.int64)], crs="EPSG:4326"
+    )
+    with pytest.warns(UserWarning, match="'crs' was not provided"):
+        _write_layer(
+            path, "b", ["v"], [np.array([3, 4], dtype=np.int64)], crs=None
+        )
+
+    with pytest.raises(ValueError, match="incompatible CRS"):
+        read_arrow_layers(path)
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_incompatible_field_types(tmp_path):
+    path = tmp_path / "incompat.gpkg"
+    _write_layer(path, "a", ["v"], [np.array([1, 2], dtype=np.int64)])
+    _write_layer(path, "b", ["v"], [np.array(["x", "y"], dtype=object)])
+
+    with pytest.raises(ValueError, match="cannot be aligned to a common Arrow schema"):
+        read_arrow_layers(path)
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_reserved_column(tmp_path):
+    path = tmp_path / "reserved.gpkg"
+    _write_layer(path, "a", ["source_fid"], [np.array([1, 2], dtype=np.int64)])
+    _write_layer(path, "b", ["v"], [np.array([3, 4], dtype=np.int64)])
+
+    with pytest.raises(ValueError, match="reserved output columns"):
+        read_arrow_layers(path)
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_invalid_layer(multilayer_gpkg):
+    with pytest.raises(ValueError, match="not found in data source"):
+        read_arrow_layers(multilayer_gpkg, layers=["does_not_exist"])
+
+    with pytest.raises(ValueError, match="out of range"):
+        read_arrow_layers(multilayer_gpkg, layers=[99])
+
+    with pytest.raises(TypeError, match="must be a layer name"):
+        read_arrow_layers(multilayer_gpkg, layers=[1.5])
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_empty_layers(multilayer_gpkg):
+    with pytest.raises(ValueError, match="at least one layer"):
+        read_arrow_layers(multilayer_gpkg, layers=[])
+
+
+@requires_arrow_write_api
+def test_open_arrow_layers_pyarrow(multilayer_gpkg):
+    with open_arrow_layers(multilayer_gpkg, batch_size=2, use_pyarrow=True) as (
+        meta,
+        reader,
+    ):
+        assert isinstance(reader, pyarrow.RecordBatchReader)
+        batches = list(reader)
+
+    assert len(batches) == 3  # 2 rows per layer, batch_size 2
+    assert all(batch.num_rows == 2 for batch in batches)
+    assert [b["source_layer"][0].as_py() for b in batches] == [
+        "layer_a",
+        "layer_b",
+        "layer_c",
+    ]
+
+
+@requires_arrow_write_api
+def test_open_arrow_layers_streams_per_layer(multilayer_gpkg, monkeypatch):
+    """Only one layer is open at a time while streaming batches."""
+    events = []
+    original = pyogrio.raw.open_arrow
+
+    @contextlib.contextmanager
+    def tracking_open_arrow(*args, **kwargs):
+        layer = kwargs.get("layer")
+        events.append(("open", layer))
+        try:
+            with original(*args, **kwargs) as result:
+                yield result
+        finally:
+            events.append(("close", layer))
+
+    monkeypatch.setattr(pyogrio.raw, "open_arrow", tracking_open_arrow)
+
+    with open_arrow_layers(
+        multilayer_gpkg, layers=["layer_a", "layer_b"], use_pyarrow=True
+    ) as (meta, reader):
+        # schema inspection opens and closes every layer up front
+        assert ("open", "layer_b") in events
+        assert ("close", "layer_b") in events
+        events.clear()
+
+        # read only the first batch; the second layer must not be opened yet
+        first = reader.read_next_batch()
+        assert first["source_layer"][0].as_py() == "layer_a"
+        assert ("open", "layer_b") not in events
+
+        reader.read_all()
+
+    assert ("open", "layer_b") in events
+
+
+@requires_arrow_write_api
+def test_open_arrow_layers_capsule_stream(multilayer_gpkg):
+    with open_arrow_layers(multilayer_gpkg) as (meta, stream):
+        assert hasattr(stream, "__arrow_c_stream__")
+        table = pyarrow.table(stream)
+
+    assert table.num_rows == 6
+    assert table["source_layer"].to_pylist() == ["layer_a"] * 2 + [
+        "layer_b"
+    ] * 2 + ["layer_c"] * 2
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_write_back(multilayer_gpkg, tmp_path):
+    """The combined stream can be passed directly to write_arrow."""
+    out = tmp_path / "combined.gpkg"
+
+    with open_arrow_layers(multilayer_gpkg) as (meta, stream):
+        write_arrow(
+            stream,
+            out,
+            crs=meta["crs"],
+            geometry_type=meta["geometry_type"],
+        )
+
+    meta_out, table_out = read_arrow(out)
+    assert table_out.num_rows == 6
+    assert table_out["source_layer"].to_pylist() == ["layer_a"] * 2 + [
+        "layer_b"
+    ] * 2 + ["layer_c"] * 2
+    assert table_out["source_fid"].to_pylist() == [1, 2, 1, 2, 1, 2]
+
+
+@requires_arrow_write_api
+def test_read_arrow_layers_max_features_per_layer(multilayer_gpkg):
+    meta, table = read_arrow_layers(
+        multilayer_gpkg, layers=["layer_a", "layer_b"], max_features=1
+    )
+    assert table["source_layer"].to_pylist() == ["layer_a", "layer_b"]
+    assert table["source_fid"].to_pylist() == [1, 1]
