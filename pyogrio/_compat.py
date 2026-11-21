@@ -56,3 +56,8 @@ HAS_GDAL_GEOS = __gdal_geos_version__ is not None
 
 HAS_SHAPELY = shapely is not None and Version(shapely.__version__) >= Version("2.0.0")
 SHAPELY_GE_21 = shapely is not None and Version(shapely.__version__) >= Version("2.1.0")
+
+# shapely.make_valid with method="structure" requires shapely >= 2.1 and GEOS >= 3.10
+HAS_MAKE_VALID_STRUCTURE = (
+    SHAPELY_GE_21 and shapely is not None and shapely.geos_version >= (3, 10, 0)
+)

@@ -11,6 +11,7 @@ except Exception:
     pass
 
 from pyogrio._version import get_versions
+from pyogrio.acceptance import read_accepted
 from pyogrio.core import (
     __gdal_geos_version__,
     __gdal_version__,
@@ -47,6 +48,7 @@ __all__ = [
     "list_drivers_details",
     "list_layers",
     "open_arrow",
+    "read_accepted",
     "read_arrow",
     "read_bounds",
     "read_dataframe",

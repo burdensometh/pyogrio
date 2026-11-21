@@ -2,6 +2,19 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add an optional geometry acceptance pipeline (`pyogrio.read_accepted` and
+    the `pyogrio.acceptance` module): after WKB parsing, each geometry is
+    classified as structurally corrupt, topologically invalid, empty, missing,
+    or valid. Invalid geometries are repaired with GEOS MakeValid (via
+    shapely) where possible; the rest are rejected or quarantined with their
+    original FIDs preserved. Only valid or explicitly kept geometries remain
+    in the read result, attribute columns stay aligned with the per-feature
+    repair/rejection status reported in the `AcceptanceReport`, and the layer
+    geometry type is updated so repaired geometries (e.g. Polygon ->
+    MultiPolygon) can still be written out correctly.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

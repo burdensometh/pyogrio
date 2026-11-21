@@ -37,6 +37,14 @@ GeoPandas integration
 .. autofunction:: pyogrio.read_dataframe
 .. autofunction:: pyogrio.write_dataframe
 
+Geometry acceptance
+-------------------
+
+.. autofunction:: pyogrio.read_accepted
+
+.. automodule:: pyogrio.acceptance
+   :members: accept_geometries, accept_read_result, AcceptanceReport, AcceptanceResult, AcceptedRead, QuarantinedFeatures
+
 Arrow integration
 -----------------
 
