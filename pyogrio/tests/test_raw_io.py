@@ -800,6 +800,174 @@ def test_write_gdalclose_error(naturalearth_lowres):
         write(filename, geometry, field_data, **meta)
 
 
+def test_write_atomic_gpkg(tmp_path, naturalearth_lowres):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+    meta.update({"geometry_type": "MultiPolygon"})
+
+    filename = tmp_path / "test.gpkg"
+    write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+
+    assert filename.exists()
+    # no staging files are left behind
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+
+    # the default layer name is derived from the target file name, not from
+    # the staging file
+    assert np.array_equal(list_layers(filename), [["test", "MultiPolygon"]])
+
+    # data round-trips correctly
+    assert read_info(filename)["features"] == len(geometry)
+
+
+def test_write_atomic_gpkg_explicit_layer(tmp_path, naturalearth_lowres):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+    meta.update({"geometry_type": "MultiPolygon"})
+
+    filename = tmp_path / "test.gpkg"
+    write(
+        filename,
+        geometry,
+        field_data,
+        driver="GPKG",
+        layer="my_layer",
+        atomic=True,
+        **meta,
+    )
+
+    assert np.array_equal(list_layers(filename), [["my_layer", "MultiPolygon"]])
+
+
+def test_write_atomic_gpkg_failure_preserves_target(
+    tmp_path, naturalearth_lowres, monkeypatch
+):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+    meta.update({"geometry_type": "MultiPolygon"})
+
+    filename = tmp_path / "test.gpkg"
+    write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+    original_bytes = filename.read_bytes()
+
+    # simulate a failure halfway through writing the staging file
+    def failing_write(path, *args, **kwargs):
+        with open(path, "wb") as f:
+            f.write(b"partial data")
+        # SQLite-based formats may leave sidecar files behind
+        with open(path + "-wal", "wb") as f:
+            f.write(b"partial data")
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(pyogrio.raw, "ogr_write", failing_write)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+
+    # the target file still has its last complete data and the staging files
+    # are cleaned up
+    assert filename.read_bytes() == original_bytes
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+    assert read_info(filename)["features"] == len(geometry)
+
+
+def test_write_atomic_gpkg_cancel_preserves_target(
+    tmp_path, naturalearth_lowres, monkeypatch
+):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+    meta.update({"geometry_type": "MultiPolygon"})
+
+    filename = tmp_path / "test.gpkg"
+    write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+    original_bytes = filename.read_bytes()
+
+    # simulate the user cancelling halfway through writing the staging file
+    def cancelling_write(path, *args, **kwargs):
+        with open(path, "wb") as f:
+            f.write(b"partial data")
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pyogrio.raw, "ogr_write", cancelling_write)
+
+    with pytest.raises(KeyboardInterrupt):
+        write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+
+    assert filename.read_bytes() == original_bytes
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+
+
+def test_write_atomic_gpkg_invalid_input_preserves_target(
+    tmp_path, naturalearth_lowres
+):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+    meta.update({"geometry_type": "MultiPolygon"})
+
+    filename = tmp_path / "test.gpkg"
+    write(filename, geometry, field_data, driver="GPKG", atomic=True, **meta)
+    original_bytes = filename.read_bytes()
+
+    # invalid input data (field arrays of mismatched length)
+    bad_field_data = list(field_data)
+    bad_field_data[0] = bad_field_data[0][:5]
+
+    with pytest.raises(ValueError, match="must be same length"):
+        write(filename, geometry, bad_field_data, driver="GPKG", atomic=True, **meta)
+
+    assert filename.read_bytes() == original_bytes
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+
+
+@pytest.mark.parametrize(
+    "driver,ext",
+    [("ESRI Shapefile", ".shp"), ("GeoJSON", ".geojson"), ("FlatGeobuf", ".fgb")],
+)
+def test_write_atomic_unsupported_driver(tmp_path, naturalearth_lowres, driver, ext):
+    # formats that consist of multiple files (e.g. ESRI Shapefile with its
+    # sidecar files) cannot be replaced atomically as a single file
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+
+    filename = tmp_path / f"test{ext}"
+    with pytest.raises(ValueError, match="'atomic' is not supported for the"):
+        write(filename, geometry, field_data, driver=driver, atomic=True, **meta)
+
+    assert not filename.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_write_atomic_append_unsupported(tmp_path, naturalearth_lowres):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+
+    filename = tmp_path / "test.gpkg"
+    with pytest.raises(ValueError, match="not supported in combination with append"):
+        write(
+            filename,
+            geometry,
+            field_data,
+            driver="GPKG",
+            atomic=True,
+            append=True,
+            **meta,
+        )
+
+
+def test_write_atomic_memory_unsupported(naturalearth_lowres):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+
+    with pytest.raises(ValueError, match="only supported for writing to a local"):
+        write(BytesIO(), geometry, field_data, driver="GPKG", atomic=True, **meta)
+
+
+def test_write_atomic_vsi_unsupported(naturalearth_lowres):
+    meta, _, geometry, field_data = read(naturalearth_lowres)
+
+    with pytest.raises(ValueError, match="only supported for writing to a local"):
+        write(
+            "/vsimem/test.gpkg",
+            geometry,
+            field_data,
+            driver="GPKG",
+            atomic=True,
+            **meta,
+        )
+
+
 def assert_equal_result(result1, result2):
     meta1, index1, geometry1, field_data1 = result1
     meta2, index2, geometry2, field_data2 = result2

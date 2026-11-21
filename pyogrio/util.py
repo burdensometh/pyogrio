@@ -1,13 +1,18 @@
 """Utility functions."""
 
+import contextlib
+import os
 import re
 import sys
+import uuid
+import warnings
 from packaging.version import Version
 from pathlib import Path
 from urllib.parse import urlparse
 
 from pyogrio._ogr import MULTI_EXTENSIONS
 from pyogrio._vsi import vsimem_rmtree_toplevel as _vsimem_rmtree_toplevel
+from pyogrio.errors import DataSourceError
 
 
 def get_vsi_path_or_buffer(path_or_buffer):
@@ -256,3 +261,156 @@ def vsimem_rmtree_toplevel(path: str | Path):
         path = path.as_posix()
 
     _vsimem_rmtree_toplevel(path)
+
+
+# Drivers for which atomic publishing of a local file is supported.  This is
+# limited to formats that consist of a single file; formats that are made up of
+# multiple files (e.g. ESRI Shapefile with its .shp/.dbf/.prj/... sidecar
+# files) cannot be replaced atomically as a single unit.
+_ATOMIC_WRITE_SUPPORTED_DRIVERS = {"GPKG"}
+
+# Sidecar files that SQLite-based formats (e.g. GPKG) may create while writing
+_SQLITE_SIDECAR_SUFFIXES = ("-journal", "-shm", "-wal")
+
+
+def _validate_atomic_write(path, driver, append):
+    """Validate that atomic publishing is supported for the given output.
+
+    Raises
+    ------
+    ValueError
+        If atomic publishing is not supported for the given path, driver or
+        append mode.
+
+    """
+    if append:
+        raise ValueError("'atomic' is not supported in combination with append")
+
+    if not isinstance(path, str) or path.startswith("/vsi"):
+        raise ValueError(
+            "'atomic' is only supported for writing to a local file path; it is "
+            "not supported for in-memory files or /vsi/ paths"
+        )
+
+    if driver not in _ATOMIC_WRITE_SUPPORTED_DRIVERS:
+        supported = ", ".join(sorted(_ATOMIC_WRITE_SUPPORTED_DRIVERS))
+        raise ValueError(
+            f"'atomic' is not supported for the {driver!r} driver (currently only "
+            f"supported for: {supported}). Formats that consist of multiple files "
+            "(e.g. ESRI Shapefile with its sidecar files) cannot be replaced "
+            "atomically as a single file."
+        )
+
+
+def _default_layer_name(path):
+    """Get the default layer name for a new layer written to path.
+
+    Mirrors the logic used when writing (based on the file name), so that a
+    layer can be created with the correct name while writing to a staging file
+    with a different file name.
+    """
+    # For multi extensions (e.g. ".gpkg.zip"), strip the full extension
+    for multi_ext in MULTI_EXTENSIONS:
+        if path.endswith(multi_ext):
+            return os.path.split(path)[1][: -len(multi_ext)]
+
+    return os.path.splitext(os.path.split(path)[1])[0]
+
+
+def _verify_staging_file(staging_path, layer):
+    """Verify a fully written and closed staging file before publishing it.
+
+    Opens the file with a fresh dataset handle and checks that the expected
+    layer is present.  Raises DataSourceError if the file is not valid.
+    """
+    # local import: requires the GDAL environment to be initialized, which is
+    # only guaranteed once pyogrio.core has been imported
+    from pyogrio._io import ogr_list_layers
+
+    try:
+        layers = ogr_list_layers(str(staging_path))
+    except Exception as exc:
+        raise DataSourceError(
+            "atomic write verification failed: could not open the written file "
+            f"{str(staging_path)!r}: {exc}"
+        ) from exc
+
+    layer_names = [layer_info[0] for layer_info in layers]
+    if not len(layer_names):
+        raise DataSourceError(
+            "atomic write verification failed: the written file "
+            f"{str(staging_path)!r} contains no layers"
+        )
+
+    if layer is not None and layer not in layer_names:
+        raise DataSourceError(
+            f"atomic write verification failed: layer {layer!r} not found in "
+            f"the written file {str(staging_path)!r}"
+        )
+
+
+def _remove_staging_files(staging_path):
+    """Remove a staging file and any of its sidecar files.
+
+    Only ever removes files derived from the staging path, never the target
+    file of an atomic publish.
+    """
+    for suffix in ("", *_SQLITE_SIDECAR_SUFFIXES):
+        staging_file = str(staging_path) + suffix
+        try:
+            os.remove(staging_file)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            warnings.warn(
+                f"could not remove staging file {staging_file!r}: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+
+@contextlib.contextmanager
+def _atomic_publish(path, layer=None):
+    """Context manager to publish a local file atomically.
+
+    Yields a staging path in the same directory as ``path`` to write the data
+    to.  When the enclosed write completes without error, the staging file is
+    verified (see :func:`_verify_staging_file`) and then moved over ``path``
+    with ``os.replace`` (atomic because the staging file is on the same file
+    system).  If the write fails or is interrupted, the staging file is
+    removed and a previously existing target file is left untouched.
+
+    Once the staging file has been moved over the target, the result is
+    considered committed and is never cleaned up as a staging file.
+
+    Parameters
+    ----------
+    path : str
+        target file path (local file system)
+    layer : str, optional
+        name of the layer that should be present in the written file; used to
+        verify the staging file before publishing
+
+    Yields
+    ------
+    str
+        path of the staging file to write to
+
+    """
+    target = Path(path)
+    staging_path = target.with_name(
+        f".{target.stem}.{uuid.uuid4().hex[:8]}.tmp{target.suffix}"
+    )
+    committed = False
+    try:
+        yield str(staging_path)
+
+        # the dataset has been closed by the write; verify before publishing
+        _verify_staging_file(staging_path, layer)
+
+        os.replace(staging_path, target)
+        committed = True
+
+    finally:
+        if not committed:
+            _remove_staging_files(staging_path)

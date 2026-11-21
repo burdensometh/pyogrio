@@ -9,8 +9,11 @@ from pyogrio._env import GDALEnv
 from pyogrio.core import detect_write_driver
 from pyogrio.errors import DataSourceError
 from pyogrio.util import (
+    _atomic_publish,
+    _default_layer_name,
     _mask_to_wkb,
     _preprocess_options_key_value,
+    _validate_atomic_write,
     get_vsi_path_or_buffer,
     vsi_path,
 )
@@ -613,6 +616,7 @@ def write(
     dataset_options=None,
     layer_options=None,
     gdal_tz_offsets=None,
+    atomic=False,
     **kwargs,
 ):
     """Write geometry and field data to an OGR file format.
@@ -676,6 +680,17 @@ def write(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+    atomic : bool, optional (default: False)
+        If True, the data are first written to a temporary staging file in the
+        same directory as ``path``, and the target file is only replaced after
+        the write has completed and the written file has been verified.  This
+        ensures that a failed or interrupted write never leaves the target
+        file in a partially written state: a previously existing file at
+        ``path`` keeps its last complete data.  Currently only supported for
+        local paths with drivers that consist of a single file (GeoPackage);
+        not supported in combination with ``append``.
+
+        .. versionadded:: 0.14.0
     dataset_metadata : dict, optional (default: None)
         Metadata to be stored at the dataset level in the output file; limited
         to drivers that support writing metadata, such as GPKG, and silently
@@ -707,6 +722,9 @@ def write(
 
     path, driver = _get_write_path_driver(path, driver, append=append)
 
+    if atomic:
+        _validate_atomic_write(path, driver, append)
+
     dataset_metadata, layer_metadata = _validate_metadata(
         dataset_metadata, layer_metadata, metadata
     )
@@ -730,8 +748,7 @@ def write(
         driver, dataset_options, layer_options, kwargs
     )
 
-    ogr_write(
-        path,
+    write_kwargs = dict(
         layer=layer,
         driver=driver,
         geometry=geometry,
@@ -751,6 +768,17 @@ def write(
         gdal_tz_offsets=gdal_tz_offsets,
     )
 
+    if atomic:
+        if layer is None:
+            # the staging file has a different file name than the target, so
+            # derive the default layer name from the target path explicitly
+            write_kwargs["layer"] = _default_layer_name(path)
+
+        with _atomic_publish(path, write_kwargs["layer"]) as staging_path:
+            ogr_write(staging_path, **write_kwargs)
+    else:
+        ogr_write(path, **write_kwargs)
+
 
 def write_arrow(
     arrow_obj,
@@ -767,6 +795,7 @@ def write_arrow(
     metadata=None,
     dataset_options=None,
     layer_options=None,
+    atomic=False,
     **kwargs,
 ):
     """Write an Arrow-compatible data source to an OGR file format.
@@ -816,6 +845,17 @@ def write_arrow(
         data to be appended to the existing records in the data source.  Not
         supported for writing to in-memory files.
         NOTE: append support is limited to specific drivers and GDAL versions.
+    atomic : bool, optional (default: False)
+        If True, the data are first written to a temporary staging file in the
+        same directory as ``path``, and the target file is only replaced after
+        the write has completed and the written file has been verified.  This
+        ensures that a failed or interrupted write never leaves the target
+        file in a partially written state: a previously existing file at
+        ``path`` keeps its last complete data.  Currently only supported for
+        local paths with drivers that consist of a single file (GeoPackage);
+        not supported in combination with ``append``.
+
+        .. versionadded:: 0.14.0
     dataset_metadata : dict, optional (default: None)
         Metadata to be stored at the dataset level in the output file; limited
         to drivers that support writing metadata, such as GPKG, and silently
@@ -854,6 +894,9 @@ def write_arrow(
 
     path, driver = _get_write_path_driver(path, driver, append=append)
 
+    if atomic:
+        _validate_atomic_write(path, driver, append)
+
     if "promote_to_multi" in kwargs:
         raise ValueError(
             "The 'promote_to_multi' option is not supported when writing using Arrow"
@@ -880,8 +923,7 @@ def write_arrow(
         driver, dataset_options, layer_options, kwargs
     )
 
-    ogr_write_arrow(
-        path,
+    write_kwargs = dict(
         layer=layer,
         driver=driver,
         arrow_obj=arrow_obj,
@@ -895,3 +937,14 @@ def write_arrow(
         dataset_kwargs=dataset_kwargs,
         layer_kwargs=layer_kwargs,
     )
+
+    if atomic:
+        if layer is None:
+            # the staging file has a different file name than the target, so
+            # derive the default layer name from the target path explicitly
+            write_kwargs["layer"] = _default_layer_name(path)
+
+        with _atomic_publish(path, write_kwargs["layer"]) as staging_path:
+            ogr_write_arrow(staging_path, **write_kwargs)
+    else:
+        ogr_write_arrow(path, **write_kwargs)

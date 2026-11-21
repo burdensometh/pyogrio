@@ -492,6 +492,98 @@ def test_write_gpkg_multiple_layers(tmp_path, naturalearth_lowres):
     )
 
 
+@pytest.mark.filterwarnings("ignore:A geometry of type POLYGON is inserted")
+@requires_arrow_write_api
+def test_write_atomic_gpkg(tmp_path, naturalearth_lowres):
+    meta, table = read_arrow(naturalearth_lowres)
+
+    filename = tmp_path / "test.gpkg"
+    write_arrow(
+        table,
+        filename,
+        driver="GPKG",
+        crs=meta["crs"],
+        geometry_type="MultiPolygon",
+        geometry_name=meta["geometry_name"] or "wkb_geometry",
+        atomic=True,
+    )
+
+    assert filename.exists()
+    # no staging files are left behind
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+
+    # the default layer name is derived from the target file name, not from
+    # the staging file
+    assert np.array_equal(list_layers(filename), [["test", "MultiPolygon"]])
+
+    # data round-trips correctly
+    assert read_info(filename)["features"] == len(table)
+
+
+@pytest.mark.filterwarnings("ignore:A geometry of type POLYGON is inserted")
+@requires_arrow_write_api
+def test_write_atomic_gpkg_failure_preserves_target(
+    tmp_path, naturalearth_lowres, monkeypatch
+):
+    meta, table = read_arrow(naturalearth_lowres)
+
+    filename = tmp_path / "test.gpkg"
+    write_arrow(
+        table,
+        filename,
+        driver="GPKG",
+        crs=meta["crs"],
+        geometry_type="MultiPolygon",
+        geometry_name=meta["geometry_name"] or "wkb_geometry",
+        atomic=True,
+    )
+    original_bytes = filename.read_bytes()
+
+    # simulate a failure halfway through writing the staging file
+    def failing_write(path, *args, **kwargs):
+        with open(path, "wb") as f:
+            f.write(b"partial data")
+        raise RuntimeError("simulated write failure")
+
+    monkeypatch.setattr(pyogrio.raw, "ogr_write_arrow", failing_write)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        write_arrow(
+            table,
+            filename,
+            driver="GPKG",
+            crs=meta["crs"],
+            geometry_type="MultiPolygon",
+            geometry_name=meta["geometry_name"] or "wkb_geometry",
+            atomic=True,
+        )
+
+    # the target file still has its last complete data and the staging file
+    # is cleaned up
+    assert filename.read_bytes() == original_bytes
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+    assert read_info(filename)["features"] == len(table)
+
+
+@requires_arrow_write_api
+def test_write_atomic_unsupported_driver(tmp_path, naturalearth_lowres):
+    meta, table = read_arrow(naturalearth_lowres)
+
+    filename = tmp_path / "test.shp"
+    with pytest.raises(ValueError, match="'atomic' is not supported for the"):
+        write_arrow(
+            table,
+            filename,
+            crs=meta["crs"],
+            geometry_type=meta["geometry_type"],
+            geometry_name=meta["geometry_name"] or "wkb_geometry",
+            atomic=True,
+        )
+
+    assert not filename.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
 @requires_arrow_write_api
 def test_write_geojson(tmp_path, naturalearth_lowres):
     meta, table = read_arrow(naturalearth_lowres)

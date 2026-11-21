@@ -536,6 +536,7 @@ def write_dataframe(
     nan_as_null=True,
     append=False,
     use_arrow=None,
+    atomic=False,
     dataset_metadata=None,
     layer_metadata=None,
     metadata=None,
@@ -609,6 +610,17 @@ def write_dataframe(
         by setting the ``PYOGRIO_USE_ARROW=1`` environment variable.
         Using Arrow does not support writing an object-dtype column with
         mixed types.
+    atomic : bool, optional (default: False)
+        If True, the data are first written to a temporary staging file in the
+        same directory as ``path``, and the target file is only replaced after
+        the write has completed and the written file has been verified.  This
+        ensures that a failed or interrupted write never leaves the target
+        file in a partially written state: a previously existing file at
+        ``path`` keeps its last complete data.  Currently only supported for
+        local paths with drivers that consist of a single file (GeoPackage);
+        not supported in combination with ``append``.
+
+        .. versionadded:: 0.14.0
     dataset_metadata : dict, optional (default: None)
         Metadata to be stored at the dataset level in the output file; limited
         to drivers that support writing metadata, such as GPKG, and silently
@@ -877,6 +889,7 @@ def write_dataframe(
             crs=crs,
             encoding=encoding,
             append=append,
+            atomic=atomic,
             dataset_metadata=dataset_metadata,
             layer_metadata=layer_metadata,
             metadata=metadata,
@@ -959,6 +972,7 @@ def write_dataframe(
         promote_to_multi=promote_to_multi,
         nan_as_null=nan_as_null,
         append=append,
+        atomic=atomic,
         dataset_metadata=dataset_metadata,
         layer_metadata=layer_metadata,
         metadata=metadata,

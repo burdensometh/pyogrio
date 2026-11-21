@@ -410,6 +410,25 @@ data source must exactly match the structure of the existing data source.
 NOTE: not all drivers that support write capabilities support append
 capabilities for a given GDAL version.
 
+## Writing files atomically
+
+When overwriting an existing file, a failed or interrupted write can leave the
+file in a partially written state. To avoid this, you can write local files
+atomically with `atomic=True`: the data are first written to a temporary
+staging file in the same directory, and the target file is only replaced after
+the write has completed and the written file has been verified. If the write
+fails or is cancelled, a previously existing file at the target path keeps its
+last complete data.
+
+```
+>>> write_dataframe(df, "/tmp/existing_file.gpkg", atomic=True)
+```
+
+This is currently only supported for local paths with drivers that consist of
+a single file (GeoPackage); formats that are made up of multiple files (e.g.
+ESRI Shapefile with its sidecar files) cannot be replaced atomically as a
+single file. It cannot be combined with `append=True`.
+
 ## Reading from compressed files / archives
 
 GDAL supports reading directly from an archive, such as a zipped folder, without

@@ -2,6 +2,17 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add an `atomic` parameter to `write_dataframe`, `pyogrio.raw.write` and
+    `pyogrio.raw.write_arrow` to publish local files atomically: the data are
+    first written to a staging file in the same directory and the target file
+    is only replaced after the write has completed and the written file has
+    been verified. A failed or interrupted write therefore never leaves the
+    target file in a partially written state, and a previously existing target
+    file keeps its last complete data. Currently supported for GeoPackage
+    output.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

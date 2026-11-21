@@ -2059,6 +2059,60 @@ def test_write_dataframe(tmp_path, naturalearth_lowres, ext, use_arrow):
     )
 
 
+@pytest.mark.requires_arrow_write_api
+def test_write_dataframe_atomic_gpkg(tmp_path, naturalearth_lowres, use_arrow):
+    input_gdf = read_dataframe(naturalearth_lowres, **NE_KWARGS)
+    output_path = tmp_path / "test.gpkg"
+
+    write_dataframe(input_gdf, output_path, use_arrow=use_arrow, atomic=True)
+
+    assert output_path.exists()
+    # no staging files are left behind
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+
+    # the default layer name is derived from the target file name, not from
+    # the staging file
+    assert np.array_equal(list_layers(output_path), [["test", "MultiPolygon"]])
+
+    result_gdf = read_dataframe(output_path)
+    assert_geodataframe_equal(result_gdf, input_gdf, check_index_type=False)
+
+
+@pytest.mark.requires_arrow_write_api
+def test_write_dataframe_atomic_gpkg_failure_preserves_target(
+    tmp_path, naturalearth_lowres, use_arrow, monkeypatch
+):
+    import pyogrio.raw
+
+    input_gdf = read_dataframe(naturalearth_lowres, **NE_KWARGS)
+    output_path = tmp_path / "test.gpkg"
+
+    write_dataframe(input_gdf, output_path, use_arrow=use_arrow, atomic=True)
+    original_bytes = output_path.read_bytes()
+
+    # simulate a failure halfway through writing the staging file
+    def failing_write(path, *args, **kwargs):
+        with open(path, "wb") as f:
+            f.write(b"partial data")
+        raise RuntimeError("simulated write failure")
+
+    if use_arrow:
+        monkeypatch.setattr(pyogrio.raw, "ogr_write_arrow", failing_write)
+    else:
+        monkeypatch.setattr(pyogrio.raw, "ogr_write", failing_write)
+
+    with pytest.raises(RuntimeError, match="simulated write failure"):
+        write_dataframe(input_gdf, output_path, use_arrow=use_arrow, atomic=True)
+
+    # the target file still has its last complete data and the staging file
+    # is cleaned up
+    assert output_path.read_bytes() == original_bytes
+    assert [f.name for f in tmp_path.iterdir()] == ["test.gpkg"]
+    assert_geodataframe_equal(
+        read_dataframe(output_path), input_gdf, check_index_type=False
+    )
+
+
 @pytest.mark.filterwarnings("ignore:.*No SRS set on layer.*")
 @pytest.mark.parametrize("write_geodf", [True, False])
 @pytest.mark.parametrize("ext", [ext for ext in ALL_EXTS + [".xlsx"] if ext != ".fgb"])
