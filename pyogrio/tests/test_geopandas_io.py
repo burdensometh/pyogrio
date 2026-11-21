@@ -216,6 +216,121 @@ def test_read_dataframe(naturalearth_lowres_all_ext):
     ]
 
 
+def test_read_dataframe_geometry_name_default(multi_geometry_file):
+    gdf = read_dataframe(multi_geometry_file)
+
+    assert gdf.geometry.name == "geometry"
+    assert gdf.geom_type.tolist() == ["Polygon", "Polygon"]
+    if HAS_PYPROJ:
+        assert gdf.crs == "EPSG:4326"
+
+
+def test_read_dataframe_geometry_name_selects_field(multi_geometry_file):
+    gdf = read_dataframe(
+        multi_geometry_file, geometry_name="centroid"
+    )
+
+    assert gdf.geometry.name == "geometry"
+    assert gdf.geom_type.tolist() == ["Point", "Point"]
+    assert gdf.columns.tolist() == ["name", "geometry"]
+    np.testing.assert_array_equal(
+        shapely.get_coordinates(gdf.geometry.values),
+        np.array([[100, 100], [200, 200]]),
+    )
+    if HAS_PYPROJ:
+        assert gdf.crs == "EPSG:4326"
+
+
+def test_read_dataframe_geometry_name_bbox(multi_geometry_file):
+    # bbox is applied against the selected centroid field
+    gdf = read_dataframe(
+        multi_geometry_file,
+        geometry_name="centroid",
+        bbox=(90, 90, 110, 110),
+    )
+    assert len(gdf) == 1
+    assert gdf.geometry.iloc[0].equals(shapely.points(100, 100))
+
+
+def test_read_dataframe_geometry_name_unknown_field_raises(
+    multi_geometry_file,
+):
+    with pytest.raises(ValueError, match="existing geometry field"):
+        read_dataframe(multi_geometry_file, geometry_name="not_a_geometry")
+
+
+def _multi_geometry_gdf():
+    import geopandas as gp
+
+    return gp.GeoDataFrame(
+        {
+            "name": ["a", "b"],
+            "main": gp.GeoSeries(
+                [shapely.box(0, 0, 1, 1), shapely.box(2, 2, 3, 3)],
+                crs="EPSG:4326",
+            ),
+            "simplified": gp.GeoSeries(
+                [shapely.points(5, 5), shapely.points(6, 6)],
+                crs="EPSG:4326",
+            ),
+        }
+    )
+
+
+def test_write_dataframe_multiple_geometry_columns_requires_name(tmp_path):
+    gdf = _multi_geometry_gdf()
+
+    with pytest.raises(ValueError, match="more than one geometry column"):
+        write_dataframe(
+            gdf, tmp_path / "out.gpkg", driver="GPKG"
+        )
+
+
+def test_write_dataframe_multiple_geometry_unknown_name_raises(tmp_path):
+    gdf = _multi_geometry_gdf()
+
+    with pytest.raises(ValueError, match="existing geometry column"):
+        write_dataframe(
+            gdf,
+            tmp_path / "out.gpkg",
+            driver="GPKG",
+            geometry_name="not_a_column",
+        )
+
+
+@pytest.mark.parametrize(
+    "geometry_name,expected_type",
+    [("main", "Polygon"), ("simplified", "Point")],
+)
+def test_write_dataframe_multiple_geometry_select_field(
+    tmp_path, geometry_name, expected_type
+):
+    gdf = _multi_geometry_gdf()
+
+    out = tmp_path / "out.gpkg"
+    write_dataframe(
+        gdf, out, driver="GPKG", geometry_name=geometry_name
+    )
+
+    # only the selected geometry is written, as the single layer geometry
+    result = read_dataframe(out)
+    assert result.geom_type.tolist() == [expected_type, expected_type]
+    assert "main" not in result.columns
+    assert "simplified" not in result.columns
+    if HAS_PYPROJ:
+        assert result.crs == "EPSG:4326"
+
+
+def test_write_dataframe_geometry_name_without_geometry_raises(tmp_path):
+    import pandas as pd
+
+    df = pd.DataFrame({"v": [1, 2]})
+    with pytest.raises(ValueError, match="does not contain any geometry column"):
+        write_dataframe(
+            df, tmp_path / "out.gpkg", driver="GPKG", geometry_name="x"
+        )
+
+
 def test_read_dataframe_vsi(naturalearth_lowres_vsi, use_arrow):
     df = read_dataframe(naturalearth_lowres_vsi[1], use_arrow=use_arrow)
     assert len(df) == 177

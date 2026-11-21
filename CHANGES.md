@@ -2,6 +2,21 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add `geometry_name` keyword to `read`, `read_arrow`, `open_arrow`,
+    `read_dataframe` and `read_bounds` to select which geometry field to read
+    from layers that have more than one geometry column. The selected field is
+    used consistently for the returned geometries, CRS, geometry type and the
+    `bbox`/`mask` spatial filters, and its name is exposed as
+    `meta["geometry_name"]`. Selecting a non-default geometry field through the
+    Arrow interface requires GDAL >= 3.8; the non-Arrow interface works on all
+    supported GDAL versions. An unknown field name raises an error.
+-   Add `geometry_name` keyword to `write_dataframe` to select which geometry
+    column to write when the GeoDataFrame has more than one geometry column;
+    only that column is written to single-geometry drivers. Missing or unknown
+    geometry column names raise an error.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

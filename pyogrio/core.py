@@ -178,6 +178,7 @@ def read_bounds(
     where=None,
     bbox=None,
     mask=None,
+    geometry_name=None,
 ):
     """Read bounds of each feature.
 
@@ -218,6 +219,11 @@ def read_bounds(
         geometries with bounding boxes that intersect the bounding box of this
         geometry will be returned.  Requires Shapely >= 2.0.
         Cannot be combined with ``bbox`` keyword.
+    geometry_name : str, optional (default: None)
+        Name of the geometry field of the layer to compute the bounds for. This
+        is only relevant for data sources that have multiple geometry fields.
+        By default, the bounds of the first geometry field are returned, and
+        the ``bbox``/``mask`` filters are applied against that same field.
 
     Returns
     -------
@@ -235,6 +241,7 @@ def read_bounds(
         where=where,
         bbox=bbox,
         mask=_mask_to_wkb(mask),
+        geometry_name=geometry_name,
     )
 
 

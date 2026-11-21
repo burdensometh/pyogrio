@@ -157,6 +157,7 @@ def read_dataframe(
     arrow_to_pandas_kwargs=None,
     datetime_as_string=False,
     mixed_offsets_as_utc=True,
+    geometry_name=None,
     **kwargs,
 ):
     """Read from an OGR data source to a GeoPandas GeoDataFrame or Pandas DataFrame.
@@ -313,6 +314,15 @@ def read_dataframe(
           option, but you lose the functionality of a datetime64 column.
 
         If ``datetime_as_string`` is True, this option is ignored.
+    geometry_name : str, optional (default: None)
+        Name of the geometry field of the layer to read. This is only relevant
+        for data sources that have multiple geometry fields (e.g. a GeoPackage
+        layer with both a main outline and a simplified geometry). By default,
+        the first geometry field of the layer is used. The CRS of the returned
+        GeoDataFrame, the geometry column name in the read metadata and the
+        ``bbox``/``mask`` spatial filters all refer to this same field. With
+        ``use_arrow=True``, selecting a non-default geometry field requires
+        GDAL >= 3.8.0.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR. Invalid
@@ -396,6 +406,7 @@ def read_dataframe(
         sql_dialect=sql_dialect,
         return_fids=fid_as_index,
         datetime_as_string=True,
+        geometry_name=geometry_name,
         **kwargs,
     )
 
@@ -541,6 +552,7 @@ def write_dataframe(
     metadata=None,
     dataset_options=None,
     layer_options=None,
+    geometry_name=None,
     **kwargs,
 ):
     """Write GeoPandas GeoDataFrame to an OGR file format.
@@ -625,6 +637,13 @@ def write_dataframe(
     layer_options : dict, optional
         Layer creation options (format specific) passed to OGR. Specify as
         a key-value dictionary.
+    geometry_name : str, optional (default: None)
+        Name of the geometry column in ``df`` to write as the geometry field
+        of the output layer. This is required if ``df`` contains more than one
+        geometry column, as only a single geometry column can be written to
+        a single-geometry driver; the other geometry columns are not written.
+        If ``df`` has a single geometry column, this can be used to set the
+        name of the geometry field in the output file (with ``use_arrow=True``).
     **kwargs
         Additional driver-specific dataset or layer creation options passed
         to OGR. pyogrio will attempt to automatically pass those keywords
@@ -664,15 +683,41 @@ def write_dataframe(
 
     geometry_columns = df.columns[df.dtypes == "geometry"]
     if len(geometry_columns) > 1:
-        raise ValueError(
-            "'df' must have only one geometry column. "
-            "Multiple geometry columns are not supported for output using OGR."
-        )
+        if geometry_name is None:
+            raise ValueError(
+                "'df' has more than one geometry column: "
+                f"{list(geometry_columns)}. Only one geometry column can be "
+                "written to a single-geometry driver. Use 'geometry_name' to "
+                "specify which geometry column to write."
+            )
+        if geometry_name not in geometry_columns:
+            raise ValueError(
+                f"'geometry_name' must be the name of an existing geometry "
+                f"column; got {geometry_name!r}. Available geometry columns: "
+                f"{list(geometry_columns)}"
+            )
 
-    if len(geometry_columns) > 0:
+        geometry_column = geometry_name
+        geometry = df[geometry_column]
+        # only the selected geometry column is written as the layer geometry;
+        # the other geometry columns cannot be represented by a single-geometry
+        # driver and are therefore excluded from the output
+        df = df.drop(columns=list(geometry_columns.drop(geometry_column)))
+    elif len(geometry_columns) > 0:
         geometry_column = geometry_columns[0]
         geometry = df[geometry_column]
+        if geometry_name is not None and geometry_name != geometry_column:
+            raise ValueError(
+                f"'geometry_name' must be the name of an existing geometry "
+                f"column; got {geometry_name!r}. Available geometry columns: "
+                f"{[geometry_column]}"
+            )
     else:
+        if geometry_name is not None:
+            raise ValueError(
+                f"'geometry_name' was set to {geometry_name!r} but 'df' does "
+                "not contain any geometry column"
+            )
         geometry_column = None
         geometry = None
 

@@ -638,3 +638,60 @@ def encoded_text(request):
     but ANSI code pages appear to work properly.
     """
     return request.param
+
+
+@pytest.fixture(scope="function")
+def multi_geometry_file(tmp_path):
+    """Create a SQLite dataset whose layer has two geometry fields.
+
+    The layer ``t`` has:
+      - ``GEOMETRY``: Polygon in EPSG:4326 (the default / first geometry field)
+      - ``centroid``: Point in EPSG:4326 located far away from the polygons,
+        so spatial filters against the two fields produce different results
+
+    Returns the path to the dataset.
+    """
+    import sqlite3
+
+    import shapely
+
+    polygons = shapely.to_wkb(
+        np.array(
+            [shapely.box(0, 0, 1, 1), shapely.box(2, 2, 3, 3)], dtype=object
+        )
+    )
+    points = shapely.to_wkb(
+        np.array(
+            [shapely.points(100, 100), shapely.points(200, 200)], dtype=object
+        )
+    )
+
+    path = tmp_path / "multi_geometry.sqlite"
+    write(
+        path,
+        polygons,
+        [np.array(["a", "b"])],
+        fields=["name"],
+        driver="SQLite",
+        layer="t",
+        geometry_type="Polygon",
+        crs="EPSG:4326",
+    )
+
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("ALTER TABLE t ADD COLUMN centroid BLOB")
+    # SpatiaLite geometry type code for Point is 1
+    cur.execute(
+        "INSERT INTO geometry_columns VALUES ('t', 'centroid', 1, 2, 4326, 'WKB')"
+    )
+    cur.execute(
+        "UPDATE t SET centroid=? WHERE ogc_fid=1", (points[0],)
+    )
+    cur.execute(
+        "UPDATE t SET centroid=? WHERE ogc_fid=2", (points[1],)
+    )
+    con.commit()
+    con.close()
+
+    return path

@@ -32,7 +32,12 @@ from pyogrio._err import (
     NullPointerError,
     capture_errors,
 )
-from pyogrio._geometry cimport get_geometry_type, get_geometry_type_code
+from pyogrio._geometry cimport (
+    get_geometry_field_index,
+    get_geometry_field_name,
+    get_geometry_type,
+    get_geometry_type_code,
+)
 from pyogrio._ogr cimport *
 from pyogrio._ogr import MULTI_EXTENSIONS
 from pyogrio._vsi cimport *
@@ -423,27 +428,41 @@ cdef OGRLayerH execute_sql(
         raise DataLayerError(str(exc))
 
 
-cdef str get_crs(OGRLayerH ogr_layer):
-    """Read CRS from layer as EPSG:<code> if available or WKT.
+cdef str get_crs(OGRLayerH ogr_layer, int geom_field_index=0):
+    """Read CRS from a geometry field of a layer as EPSG:<code> if available or WKT.
 
     Parameters
     ----------
     ogr_layer : OGRLayerH
         The open OGR layer to get the CRS from
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the layer to get the CRS from
 
     Returns
     -------
     str or None
         EPSG:<code> or WKT
     """
+    cdef void *ogr_featuredef = NULL
+    cdef void *ogr_geomfielddef = NULL
     cdef void *ogr_crs = NULL
     cdef const char *authority_key = NULL
     cdef const char *authority_val = NULL
     cdef char *ogr_wkt = NULL
 
+    with nogil:
+        ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
+
+    # Nonspatial layers do not have any geometry fields
+    if OGR_FD_GetGeomFieldCount(ogr_featuredef) == 0:
+        return None
+
     try:
         with nogil:
-            ogr_crs = OGR_L_GetSpatialRef(ogr_layer)
+            ogr_geomfielddef = OGR_FD_GetGeomFieldDefn(
+                ogr_featuredef, geom_field_index
+            )
+            ogr_crs = OGR_GFld_GetSpatialRef(ogr_geomfielddef)
         ogr_crs = check_pointer(ogr_crs)
 
     except NullPointerError:
@@ -581,7 +600,9 @@ cdef get_feature_count(OGRLayerH ogr_layer, int force):
     return feature_count
 
 
-cdef get_total_bounds(OGRLayerH ogr_layer, int force):
+cdef get_total_bounds(
+    OGRLayerH ogr_layer, int force, int geom_field_index=0
+):
     """Get the total bounds of a layer.
 
     Parameters
@@ -590,6 +611,8 @@ cdef get_total_bounds(OGRLayerH ogr_layer, int force):
         The open OGR layer
     force : bool
         True if the total bounds should be computed even if it is expensive
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the layer to compute the bounds for
 
     Returns
     -------
@@ -599,7 +622,9 @@ cdef get_total_bounds(OGRLayerH ogr_layer, int force):
     cdef OGREnvelope ogr_envelope
 
     with nogil:
-        err = OGR_L_GetExtent(ogr_layer, &ogr_envelope, force)
+        err = OGR_L_GetExtentEx(
+            ogr_layer, geom_field_index, &ogr_envelope, force
+        )
     if err == OGRERR_NONE:
         bounds = (
            ogr_envelope.MinX, ogr_envelope.MinY, ogr_envelope.MaxX, ogr_envelope.MaxY
@@ -859,7 +884,7 @@ cdef apply_where_filter(OGRLayerH ogr_layer, str where):
         )
 
 
-cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
+cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox, int geom_field_index=0):
     """Applies bounding box spatial filter to layer.
 
     Parameters
@@ -868,6 +893,8 @@ cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
         The open OGR layer to apply the filter to
     bbox : list or tuple of xmin, ymin, xmax, ymax
         Bounding box to filter on
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the layer to apply the filter to
 
     Raises
     ------
@@ -881,10 +908,12 @@ cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
 
     xmin, ymin, xmax, ymax = bbox
     with nogil:
-        OGR_L_SetSpatialFilterRect(ogr_layer, xmin, ymin, xmax, ymax)
+        OGR_L_SetSpatialFilterRectEx(
+            ogr_layer, geom_field_index, xmin, ymin, xmax, ymax
+        )
 
 
-cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
+cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb, int geom_field_index=0):
     """Applies geometry spatial filter to the layer.
 
     Parameters
@@ -893,6 +922,8 @@ cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
         The open OGR layer
     wkb : bytes
         Geometry encoded as WKB
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the layer to apply the filter to
     """
     cdef OGRGeometryH ogr_geometry = NULL
     cdef unsigned char *wkb_buffer = wkb
@@ -904,7 +935,7 @@ cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
         raise GeometryError("Could not create mask geometry") from None
 
     with nogil:
-        OGR_L_SetSpatialFilter(ogr_layer, ogr_geometry)
+        OGR_L_SetSpatialFilterEx(ogr_layer, geom_field_index, ogr_geometry)
     OGR_G_DestroyGeometry(ogr_geometry)
 
 
@@ -974,7 +1005,13 @@ cdef validate_feature_range(
 
 @cython.boundscheck(False)  # Deactivate bounds checking
 @cython.wraparound(False)   # Deactivate negative indexing.
-cdef process_geometry(OGRFeatureH ogr_feature, int i, geom_view, uint8_t force_2d):
+cdef process_geometry(
+    OGRFeatureH ogr_feature,
+    int i,
+    geom_view,
+    uint8_t force_2d,
+    int geom_field_index=0,
+):
     """Process the geometry of a feature.
 
     The geometry is stored in the geom_view array as a WKB.
@@ -989,6 +1026,8 @@ cdef process_geometry(OGRFeatureH ogr_feature, int i, geom_view, uint8_t force_2
         A view to the geometry array to save the geometry to
     force_2d : uint8_t
         Whether to force geometries to 2D
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the feature to read
 
     """
     cdef OGRGeometryH ogr_geometry = NULL
@@ -997,7 +1036,7 @@ cdef process_geometry(OGRFeatureH ogr_feature, int i, geom_view, uint8_t force_2
     cdef unsigned char *wkb = NULL
     cdef int ret_length
 
-    ogr_geometry = OGR_F_GetGeometryRef(ogr_feature)
+    ogr_geometry = OGR_F_GetGeomFieldRef(ogr_feature, geom_field_index)
 
     if ogr_geometry == NULL:
         geom_view[i] = None
@@ -1233,7 +1272,8 @@ cdef get_features(
     int skip_features,
     int num_features,
     uint8_t return_fids,
-    bint datetime_as_string
+    bint datetime_as_string,
+    int geom_field_index=0,
 ):
     """Get features from a layer.
 
@@ -1369,7 +1409,9 @@ cdef get_features(
                 fid_view[i] = OGR_F_GetFID(ogr_feature)
 
             if read_geometry:
-                process_geometry(ogr_feature, i, geom_view, force_2d)
+                process_geometry(
+                    ogr_feature, i, geom_view, force_2d, geom_field_index
+                )
 
             process_fields(
                 ogr_feature, i, n_fields, field_data_chunks[last_chunk_index],
@@ -1433,7 +1475,8 @@ cdef get_features_by_fid(
     encoding,
     uint8_t read_geometry,
     uint8_t force_2d,
-    bint datetime_as_string
+    bint datetime_as_string,
+    int geom_field_index=0,
 ):
     """Get features by their feature IDs (FIDs).
 
@@ -1511,7 +1554,9 @@ cdef get_features_by_fid(
                 raise FeatureError(str(exc))
 
             if read_geometry:
-                process_geometry(ogr_feature, i, geom_view, force_2d)
+                process_geometry(
+                    ogr_feature, i, geom_view, force_2d, geom_field_index
+                )
 
             process_fields(
                 ogr_feature, i, n_fields, field_data, field_data_view,
@@ -1527,7 +1572,12 @@ cdef get_features_by_fid(
 
 @cython.boundscheck(False)  # Deactivate bounds checking
 @cython.wraparound(False)   # Deactivate negative indexing.
-cdef get_bounds(OGRLayerH ogr_layer, int skip_features, int num_features):
+cdef get_bounds(
+    OGRLayerH ogr_layer,
+    int skip_features,
+    int num_features,
+    int geom_field_index=0,
+):
     """Get the bounds of the features in a layer.
 
     Parameters
@@ -1538,6 +1588,8 @@ cdef get_bounds(OGRLayerH ogr_layer, int skip_features, int num_features):
         The number of features to skip from the beginning of the layer
     num_features : int
         The number of features to read from the layer
+    geom_field_index : int, optional (default: 0)
+        The index of the geometry field on the layer to compute the bounds for
 
     Returns
     -------
@@ -1592,7 +1644,7 @@ cdef get_bounds(OGRLayerH ogr_layer, int skip_features, int num_features):
 
             fid_view[i] = OGR_F_GetFID(ogr_feature)
 
-            ogr_geometry = OGR_F_GetGeometryRef(ogr_feature)
+            ogr_geometry = OGR_F_GetGeomFieldRef(ogr_feature, geom_field_index)
 
             if ogr_geometry == NULL:
                 bounds_view[:, i] = np.nan
@@ -1636,6 +1688,7 @@ def ogr_read(
     str sql_dialect=None,
     int return_fids=False,
     bint datetime_as_string=False,
+    str geometry_name=None,
 ):
     """Read features from a dataset.
 
@@ -1714,7 +1767,16 @@ def ogr_read(
         else:
             ogr_layer = execute_sql(ogr_dataset, sql, sql_dialect)
 
-        crs = get_crs(ogr_layer)
+        # Resolve the geometry field to read (defaults to the first one) so
+        # that the CRS, geometry type, spatial filters and output geometries
+        # all refer to the same field.
+        if geometry_name is not None or read_geometry:
+            geom_field_index = get_geometry_field_index(ogr_layer, geometry_name)
+        else:
+            geom_field_index = 0
+        geometry_name = get_geometry_field_name(ogr_layer, geom_field_index)
+
+        crs = get_crs(ogr_layer, geom_field_index)
 
         # Encoding is derived from the user, from the dataset capabilities / type,
         # or from the system locale
@@ -1762,7 +1824,7 @@ def ogr_read(
             with nogil:
                 OGR_L_SetIgnoredFields(ogr_layer, <const char**>fields_c)
 
-        geometry_type = get_geometry_type(ogr_layer)
+        geometry_type = get_geometry_type(ogr_layer, geom_field_index)
 
         if fids is not None:
             geometries, field_data = get_features_by_fid(
@@ -1773,6 +1835,7 @@ def ogr_read(
                 read_geometry=read_geometry and geometry_type is not None,
                 force_2d=force_2d,
                 datetime_as_string=datetime_as_string,
+                geom_field_index=geom_field_index,
             )
 
             # bypass reading fids since these should match fids used for read
@@ -1787,10 +1850,10 @@ def ogr_read(
 
             # Apply the spatial filter
             if bbox is not None:
-                apply_bbox_filter(ogr_layer, bbox)
+                apply_bbox_filter(ogr_layer, bbox, geom_field_index)
 
             elif mask is not None:
-                apply_geometry_filter(ogr_layer, mask)
+                apply_geometry_filter(ogr_layer, mask, geom_field_index)
 
             # Limit feature range to available range, but avoid doing an actual count if
             # not needed (with num_features=-1, we will read in chunks in get_features)
@@ -1826,7 +1889,8 @@ def ogr_read(
                 skip_features=skip_features,
                 num_features=num_features,
                 return_fids=return_fids,
-                datetime_as_string=datetime_as_string
+                datetime_as_string=datetime_as_string,
+                geom_field_index=geom_field_index,
             )
 
         ogr_types = [FIELD_TYPE_NAMES.get(field[1], "Unknown") for field in fields]
@@ -1842,6 +1906,7 @@ def ogr_read(
             "ogr_types": ogr_types,
             "ogr_subtypes": ogr_subtypes,
             "geometry_type": geometry_type,
+            "geometry_name": geometry_name,
         }
 
     finally:
@@ -1926,6 +1991,7 @@ def ogr_open_arrow(
     int batch_size=0,
     use_pyarrow=False,
     datetime_as_string=False,
+    str geometry_name=None,
 ):
     """Open a file via the GDAL arrow interface.
 
@@ -2011,7 +2077,15 @@ def ogr_open_arrow(
         else:
             ogr_layer = execute_sql(ogr_dataset, sql, sql_dialect)
 
-        crs = get_crs(ogr_layer)
+        # Resolve the requested geometry field (defaults to the first one).
+        # The Arrow stream only exposes a single geometry field.
+        if geometry_name is not None or read_geometry:
+            geom_field_index = get_geometry_field_index(ogr_layer, geometry_name)
+        else:
+            geom_field_index = 0
+        geometry_name = get_geometry_field_name(ogr_layer, geom_field_index)
+
+        crs = get_crs(ogr_layer, geom_field_index)
 
         # Encoding is derived from the user, from the dataset capabilities / type,
         # or from the system locale
@@ -2063,9 +2137,7 @@ def ogr_open_arrow(
                             "use_arrow=True for this dataset."
                         )
 
-        geometry_type = get_geometry_type(ogr_layer)
-
-        geometry_name = get_string(OGR_L_GetGeometryColumn(ogr_layer))
+        geometry_type = get_geometry_type(ogr_layer, geom_field_index)
 
         fid_column = get_string(OGR_L_GetFIDColumn(ogr_layer))
         fid_column_where = fid_column
@@ -2110,10 +2182,10 @@ def ogr_open_arrow(
 
         # Apply the spatial filter
         if bbox is not None:
-            apply_bbox_filter(ogr_layer, bbox)
+            apply_bbox_filter(ogr_layer, bbox, geom_field_index)
 
         elif mask is not None:
-            apply_geometry_filter(ogr_layer, mask)
+            apply_geometry_filter(ogr_layer, mask, geom_field_index)
 
         # Limit feature range to available range (cannot use logic of
         # `validate_feature_range` because max_features is not supported)
@@ -2134,6 +2206,24 @@ def ogr_open_arrow(
 
         if not return_fids:
             options = CSLSetNameValue(options, "INCLUDE_FID", "NO")
+
+        # Only expose the requested geometry field in the Arrow stream.
+        # Selecting a non-default geometry field requires GDAL >= 3.8, which is
+        # when the GEOMETRY_COLUMN option was introduced for GetArrowStream.
+        IF CTE_GDAL_VERSION >= (3, 8, 0):
+            if geom_field_index > 0:
+                options = CSLSetNameValue(
+                    options,
+                    "GEOMETRY_COLUMN",
+                    geometry_name.encode("UTF-8")
+                )
+        ELSE:
+            if geom_field_index > 0:
+                raise ValueError(
+                    "Selecting a non-default geometry field with the Arrow "
+                    "interface requires GDAL >= 3.8.0; use the non-Arrow "
+                    "interface instead"
+                )
 
         if batch_size > 0:
             options = CSLSetNameValue(
@@ -2250,11 +2340,13 @@ def ogr_read_bounds(
     object where=None,
     tuple bbox=None,
     object mask=None,
+    str geometry_name=None,
 ):
     """Read bounds of features in the dataset."""
     cdef bint use_tmp_vsimem = isinstance(path_or_buffer, bytes)
     cdef OGRDataSourceH ogr_dataset = NULL
     cdef OGRLayerH ogr_layer = NULL
+    cdef int geom_field_index
 
     if bbox and mask:
         raise ValueError("cannot set both 'bbox' and 'mask'")
@@ -2276,23 +2368,27 @@ def ogr_read_bounds(
 
         ogr_layer = get_ogr_layer(ogr_dataset, layer)
 
+        geom_field_index = get_geometry_field_index(ogr_layer, geometry_name)
+
         # Apply the attribute filter
         if where is not None and where != "":
             apply_where_filter(ogr_layer, where)
 
         # Apply the spatial filter
         if bbox is not None:
-            apply_bbox_filter(ogr_layer, bbox)
+            apply_bbox_filter(ogr_layer, bbox, geom_field_index)
 
         elif mask is not None:
-            apply_geometry_filter(ogr_layer, mask)
+            apply_geometry_filter(ogr_layer, mask, geom_field_index)
 
         # Limit feature range to available range
         skip_features, num_features = validate_feature_range(
             ogr_layer, skip_features, max_features
         )
 
-        bounds = get_bounds(ogr_layer, skip_features, num_features)
+        bounds = get_bounds(
+            ogr_layer, skip_features, num_features, geom_field_index
+        )
 
     finally:
         if ogr_dataset != NULL:
@@ -2360,7 +2456,7 @@ def ogr_read_info(
             "ogr_subtypes": ogr_subtypes,
             "fid_column": get_string(OGR_L_GetFIDColumn(ogr_layer)),
             "geometry_name": get_string(OGR_L_GetGeometryColumn(ogr_layer)),
-            "geometry_type": get_geometry_type(ogr_layer),
+            "geometry_type": get_geometry_type(ogr_layer, 0),
             "features": get_feature_count(ogr_layer, force_feature_count),
             "total_bounds": get_total_bounds(ogr_layer, force_total_bounds),
             "driver": get_driver(ogr_dataset),
@@ -2501,7 +2597,7 @@ cdef get_layer_names(OGRDataSourceH ogr_dataset):
             ogr_layer = GDALDatasetGetLayer(ogr_dataset, i)
 
         data_view[i, 0] = get_string(OGR_L_GetName(ogr_layer))
-        data_view[i, 1] = get_geometry_type(ogr_layer)
+        data_view[i, 1] = get_geometry_type(ogr_layer, 0)
 
     return data
 
@@ -3334,6 +3430,19 @@ def ogr_write_arrow(
 
         if stream.get_schema(stream, &schema) != 0:
             raise RuntimeError("Could not get Arrow schema from stream.")
+
+        if geometry_name:
+            # fail explicitly if the requested geometry column is not present
+            schema_field_names = [
+                get_string(schema.children[i].name)
+                for i in range(schema.n_children)
+            ]
+            if geometry_name not in schema_field_names:
+                raise ValueError(
+                    f"'geometry_name' must be the name of an existing column in "
+                    f"the Arrow data; got {geometry_name!r}. Available columns: "
+                    f"{schema_field_names}"
+                )
 
         if layer_created:
             create_fields_from_arrow_schema(ogr_layer, &schema, options, geometry_name)

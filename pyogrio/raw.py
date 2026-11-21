@@ -54,6 +54,7 @@ def read(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    geometry_name=None,
     **kwargs,
 ):
     """Read OGR data source into numpy arrays.
@@ -153,6 +154,13 @@ def read(
         If True, will return datetime dtypes as detected by GDAL as a string
         array (which can be used to extract time zone info), instead of
         a datetime64 array.
+    geometry_name : str, optional (default: None)
+        Name of the geometry field of the layer to read. This is only relevant
+        for data sources that have multiple geometry fields (e.g. a GeoPackage
+        layer with both a main outline and a simplified geometry). By default,
+        the first geometry field of the layer is used. The selected field is
+        used consistently for the returned geometries, the CRS, the geometry
+        type and the ``bbox``/``mask`` spatial filters.
 
     **kwargs
         Additional driver-specific dataset open options passed to OGR.  Invalid
@@ -215,6 +223,7 @@ def read(
         return_fids=return_fids,
         dataset_kwargs=dataset_kwargs,
         datetime_as_string=datetime_as_string,
+        geometry_name=geometry_name,
     )
 
 
@@ -236,6 +245,7 @@ def read_arrow(
     sql_dialect=None,
     return_fids=False,
     datetime_as_string=False,
+    geometry_name=None,
     **kwargs,
 ):
     """Read OGR data source into a pyarrow Table.
@@ -311,6 +321,7 @@ def read_arrow(
         batch_size=batch_size,
         use_pyarrow=True,
         datetime_as_string=datetime_as_string,
+        geometry_name=geometry_name,
         **kwargs,
     ) as source:
         meta, reader = source
@@ -367,6 +378,7 @@ def open_arrow(
     batch_size=65_536,
     use_pyarrow=False,
     datetime_as_string=False,
+    geometry_name=None,
     **kwargs,
 ):
     """Open OGR data source as a stream of Arrow record batches.
@@ -398,6 +410,14 @@ def open_arrow(
     datetime_as_string : bool, optional (default: False)
         If True, will return datetime dtypes as detected by GDAL as strings,
         as Arrow doesn't support e.g. mixed time zones.
+    geometry_name : str, optional (default: None)
+        Name of the geometry field of the layer to read. This is only relevant
+        for data sources that have multiple geometry fields (e.g. a GeoPackage
+        layer with both a main outline and a simplified geometry). By default,
+        the first geometry field of the layer is used. The selected field is
+        used consistently for the returned geometry column, the CRS, the
+        geometry type and the ``bbox``/``mask`` spatial filters. Requires
+        GDAL >= 3.8.0 to select a non-default geometry field.
 
     Examples
     --------
@@ -467,6 +487,7 @@ def open_arrow(
         batch_size=batch_size,
         use_pyarrow=use_pyarrow,
         datetime_as_string=datetime_as_string,
+        geometry_name=geometry_name,
     )
 
 
@@ -704,6 +725,10 @@ def write(
     kwargs.pop("dtypes", None)
     kwargs.pop("ogr_types", None)
     kwargs.pop("ogr_subtypes", None)
+    # geometry_name is read metadata; the non-Arrow writer always writes the
+    # single input geometry array as the layer geometry, so it is not a write
+    # option here
+    kwargs.pop("geometry_name", None)
 
     path, driver = _get_write_path_driver(path, driver, append=append)
 

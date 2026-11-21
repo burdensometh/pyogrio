@@ -71,6 +71,71 @@ def test_read_arrow_columns(naturalearth_lowres, columns):
     assert sorted(meta["fields"]) == sorted(expected_fields)
 
 
+def test_read_arrow_geometry_name_default(multi_geometry_file):
+    meta, table = read_arrow(multi_geometry_file)
+
+    assert meta["geometry_name"] == "GEOMETRY"
+    assert meta["geometry_type"] == "Polygon"
+    assert meta["crs"] == "EPSG:4326"
+    assert "GEOMETRY" in table.schema.names
+
+
+def test_read_arrow_geometry_name_first_field_explicit(multi_geometry_file):
+    # explicitly asking for the first field works on all GDAL versions
+    meta, table = read_arrow(
+        multi_geometry_file, geometry_name="GEOMETRY"
+    )
+    assert meta["geometry_name"] == "GEOMETRY"
+    assert "GEOMETRY" in table.schema.names
+
+
+def test_read_arrow_geometry_name_unknown_field_raises(multi_geometry_file):
+    with pytest.raises(ValueError, match="existing geometry field"):
+        read_arrow(multi_geometry_file, geometry_name="not_a_geometry")
+
+
+@pytest.mark.skipif(
+    __gdal_version__ < (3, 8, 0),
+    reason="Selecting a non-default geometry field over Arrow requires GDAL >= 3.8",
+)
+def test_read_arrow_geometry_name_selects_field(multi_geometry_file):
+    import shapely
+
+    meta, table = read_arrow(
+        multi_geometry_file, geometry_name="centroid"
+    )
+
+    assert meta["geometry_name"] == "centroid"
+    assert meta["geometry_type"] == "Point"
+    assert meta["crs"] == "EPSG:4326"
+    # only the requested geometry field is exposed in the stream
+    assert "centroid" in table.schema.names
+    assert "GEOMETRY" not in table.schema.names
+
+    points = shapely.from_wkb(table["centroid"].to_numpy())
+    assert np.array_equal(
+        shapely.get_coordinates(points), np.array([[100, 100], [200, 200]])
+    )
+
+
+@pytest.mark.skipif(
+    __gdal_version__ >= (3, 8, 0),
+    reason="Failure on selecting non-default geometry field is specific to old GDAL",
+)
+def test_read_arrow_geometry_name_unsupported_old_gdal(multi_geometry_file):
+    with pytest.raises(ValueError, match="GDAL >= 3.8.0"):
+        read_arrow(multi_geometry_file, geometry_name="centroid")
+
+
+def test_open_arrow_geometry_name(multi_geometry_file):
+    with open_arrow(
+        multi_geometry_file, geometry_name="GEOMETRY", use_pyarrow=True
+    ) as (meta, reader):
+        assert meta["geometry_name"] == "GEOMETRY"
+        table = reader.read_all()
+        assert "GEOMETRY" in table.schema.names
+
+
 def test_read_arrow_unspecified_layer_warning(data_dir):
     """Reading a multi-layer file without specifying a layer gives a warning."""
     with pytest.warns(UserWarning, match="More than one layer found "):

@@ -64,6 +64,133 @@ def test_read(naturalearth_lowres):
     assert geometry[0][:6] == b"\x01\x06\x00\x00\x00\x03"
 
 
+def test_read_geometry_name_defaults_to_first_field(multi_geometry_file):
+    # without geometry_name, the first geometry field is read
+    meta, _, geometry, _ = read(multi_geometry_file)
+
+    assert meta["geometry_name"] == "GEOMETRY"
+    assert meta["geometry_type"] == "Polygon"
+    assert meta["crs"] == "EPSG:4326"
+    assert all(
+        shapely.get_type_id(g) == shapely.GeometryType.POLYGON
+        for g in shapely.from_wkb(geometry)
+    )
+
+
+def test_read_geometry_name_selects_field(multi_geometry_file):
+    meta, _, geometry, _ = read(
+        multi_geometry_file, geometry_name="centroid"
+    )
+
+    assert meta["geometry_name"] == "centroid"
+    assert meta["geometry_type"] == "Point"
+    assert meta["crs"] == "EPSG:4326"
+    points = shapely.from_wkb(geometry)
+    assert shapely.get_type_id(points).tolist() == [
+        shapely.GeometryType.POINT,
+        shapely.GeometryType.POINT,
+    ]
+    # the selected field is really the point column, not the polygon column
+    assert array_equal(
+        shapely.get_coordinates(points), np.array([[100, 100], [200, 200]])
+    )
+
+
+def test_read_geometry_name_unknown_field_raises(multi_geometry_file):
+    with pytest.raises(ValueError, match="existing geometry field"):
+        read(multi_geometry_file, geometry_name="not_a_geometry")
+
+
+def test_read_geometry_name_bbox_applied_to_same_field(multi_geometry_file):
+    # bbox intersecting only the centroid points (100,100), not the polygons
+    # (which live around 0..3)
+    _, _, geometry_centroid, _ = read(
+        multi_geometry_file,
+        geometry_name="centroid",
+        bbox=(90, 90, 110, 110),
+    )
+    assert len(geometry_centroid) == 1
+    assert shapely.from_wkb(geometry_centroid)[0].equals(
+        shapely.points(100, 100)
+    )
+
+    # the same bbox against the polygon field returns no features
+    _, _, geometry_polygon, _ = read(
+        multi_geometry_file,
+        geometry_name="GEOMETRY",
+        bbox=(90, 90, 110, 110),
+    )
+    assert len(geometry_polygon) == 0
+
+
+def test_read_geometry_name_mask_applied_to_same_field(multi_geometry_file):
+    mask = shapely.box(190, 190, 210, 210)
+    _, _, geometry, _ = read(
+        multi_geometry_file, geometry_name="centroid", mask=mask
+    )
+    assert len(geometry) == 1
+    assert shapely.from_wkb(geometry)[0].equals(shapely.points(200, 200))
+
+
+def test_read_geometry_name_with_fids(multi_geometry_file):
+    meta, _, geometry_polygon, _ = read(
+        multi_geometry_file, geometry_name="GEOMETRY", fids=[1]
+    )
+    assert meta["geometry_name"] == "GEOMETRY"
+    assert (
+        shapely.get_type_id(shapely.from_wkb(geometry_polygon)[0])
+        == shapely.GeometryType.POLYGON
+    )
+
+    _, _, geometry_point, _ = read(
+        multi_geometry_file, geometry_name="centroid", fids=[1]
+    )
+    assert shapely.from_wkb(geometry_point)[0].equals(
+        shapely.points(100, 100)
+    )
+
+
+def test_read_geometry_name_without_read_geometry(multi_geometry_file):
+    # resolving the field must still work, but no geometries are returned
+    meta, _, geometry, _ = read(
+        multi_geometry_file, geometry_name="centroid", read_geometry=False
+    )
+    assert geometry is None
+    assert meta["geometry_name"] == "centroid"
+    assert meta["geometry_type"] == "Point"
+
+
+def test_read_bounds_geometry_name(multi_geometry_file):
+    _, bounds_default = pyogrio.read_bounds(multi_geometry_file)
+    # bounds of the polygons (first geometry field)
+    assert array_equal(
+        bounds_default,
+        np.array([[0.0, 2.0], [0.0, 2.0], [1.0, 3.0], [1.0, 3.0]]),
+    )
+
+    _, bounds_centroid = pyogrio.read_bounds(
+        multi_geometry_file, geometry_name="centroid"
+    )
+    assert array_equal(
+        bounds_centroid,
+        np.array([[100.0, 200.0], [100.0, 200.0], [100.0, 200.0], [100.0, 200.0]]),
+    )
+
+
+def test_read_bounds_geometry_name_bbox_applied_to_same_field(
+    multi_geometry_file,
+):
+    # bbox filters on the centroid field; bounds are those of the survivors
+    _, bounds = pyogrio.read_bounds(
+        multi_geometry_file,
+        geometry_name="centroid",
+        bbox=(90, 90, 110, 110),
+    )
+    assert array_equal(
+        bounds, np.array([[100.0], [100.0], [100.0], [100.0]])
+    )
+
+
 @pytest.mark.parametrize("ext", DRIVERS)
 def test_read_autodetect_driver(tmp_path, naturalearth_lowres, ext):
     # Test all supported autodetect drivers

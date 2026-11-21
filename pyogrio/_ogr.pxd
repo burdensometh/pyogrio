@@ -196,6 +196,7 @@ cdef extern from "ogr_core.h":
     ctypedef void* OGRFieldDefnH
     ctypedef void* OGRFeatureH
     ctypedef void* OGRGeometryH
+    ctypedef void* OGRGeomFieldDefnH
     ctypedef void* OGRLayerH
     ctypedef void* OGRSFDriverH
 
@@ -275,6 +276,7 @@ cdef extern from "ogr_api.h":
 
     int64_t         OGR_F_GetFID(OGRFeatureH feature)
     OGRGeometryH    OGR_F_GetGeometryRef(OGRFeatureH feature)
+    OGRGeometryH    OGR_F_GetGeomFieldRef(OGRFeatureH feature, int iGeomField)
     GByte*          OGR_F_GetFieldAsBinary(OGRFeatureH feature, int n, int *s)
     int             OGR_F_GetFieldAsDateTimeEx(OGRFeatureH feature,
                                                int n,
@@ -331,6 +333,11 @@ cdef extern from "ogr_api.h":
     OGRFeatureDefnH     OGR_FD_GetFieldDefn(OGRFeatureDefnH featuredefn, int n)
     int                 OGR_FD_GetFieldIndex(OGRFeatureDefnH featuredefn,
                                              const char *name)
+    int                 OGR_FD_GetGeomFieldCount(OGRFeatureDefnH featuredefn) nogil
+    OGRGeomFieldDefnH   OGR_FD_GetGeomFieldDefn(OGRFeatureDefnH featuredefn,
+                                                 int n) nogil
+    int                 OGR_FD_GetGeomFieldIndex(OGRFeatureDefnH featuredefn,
+                                                 const char *name) nogil
     OGRwkbGeometryType  OGR_FD_GetGeomType(OGRFeatureDefnH featuredefn)
 
     OGRFieldDefnH   OGR_Fld_Create(const char *name, OGRFieldType fieldtype)
@@ -350,6 +357,10 @@ cdef extern from "ogr_api.h":
     void            OGR_Fld_SetWidth(OGRFieldDefnH fielddefn, int n)
 
     void            OGR_Fld_SetSubType(OGRFieldDefnH fielddefn, OGRFieldSubType subtype)
+
+    const char*     OGR_GFld_GetNameRef(OGRGeomFieldDefnH gfld) nogil
+    OGRSpatialReferenceH OGR_GFld_GetSpatialRef(OGRGeomFieldDefnH gfld) nogil
+    OGRwkbGeometryType  OGR_GFld_GetType(OGRGeomFieldDefnH gfld) nogil
 
     OGRGeometryH        OGR_G_CreateGeometry(int wkbtypecode)
     OGRErr              OGR_G_CreateFromWkb(const void *bytes,
@@ -392,6 +403,10 @@ cdef extern from "ogr_api.h":
     OGRErr              OGR_L_GetExtent(OGRLayerH layer,
                                         OGREnvelope *psExtent,
                                         int bForce) nogil
+    OGRErr              OGR_L_GetExtentEx(OGRLayerH layer,
+                                          int iGeomField,
+                                          OGREnvelope *psExtent,
+                                          int bForce) nogil
 
     OGRSpatialReferenceH OGR_L_GetSpatialRef(OGRLayerH layer) nogil
     int                  OGR_L_TestCapability(OGRLayerH layer, const char *name)
@@ -408,8 +423,17 @@ cdef extern from "ogr_api.h":
                                                     double ymin,
                                                     double xmax,
                                                     double ymax) nogil
+    void                 OGR_L_SetSpatialFilterRectEx(OGRLayerH layer,
+                                                      int iGeomField,
+                                                      double xmin,
+                                                      double ymin,
+                                                      double xmax,
+                                                      double ymax) nogil
     void                 OGR_L_SetSpatialFilter(OGRLayerH layer,
                                                 OGRGeometryH geometry) nogil
+    void                 OGR_L_SetSpatialFilterEx(OGRLayerH layer,
+                                                  int iGeomField,
+                                                  OGRGeometryH geometry) nogil
     OGRErr               OGR_L_SetIgnoredFields(OGRLayerH layer,
                                                 const char** fields) nogil
 

@@ -68,13 +68,96 @@ GEOMETRY_TYPES.update({
 })
 
 
-cdef str get_geometry_type(void *ogr_layer):
-    """Get geometry type for layer.
+cdef int get_geometry_field_index(void *ogr_layer, str geometry_name) except -2:
+    """Get the index of the geometry field in a layer by its name.
+
+    Parameters
+    ----------
+    ogr_layer : pointer to open OGR layer
+        The open OGR layer containing the geometry field.
+    geometry_name : str
+        The name of the geometry field. If None, the first (or only) geometry
+        field is used.
+
+    Raises
+    ------
+    ValueError
+        If the layer does not contain a geometry field with ``geometry_name``.
+
+    Returns
+    -------
+    int
+        The index of the geometry field.
+    """
+    cdef void *ogr_featuredef = NULL
+    cdef int geom_field_index
+    cdef char *geom_field_c
+
+    with nogil:
+        ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
+
+    if geometry_name is None:
+        # Default to the first geometry field. For nonspatial layers, GDAL
+        # returns a special wkbNone geometry field definition at index 0.
+        return 0
+
+    geom_field_b = geometry_name.encode("UTF-8")
+    geom_field_c = geom_field_b
+    with nogil:
+        geom_field_index = OGR_FD_GetGeomFieldIndex(ogr_featuredef, geom_field_c)
+
+    if geom_field_index < 0:
+        raise ValueError(
+            f"'geometry_name' must be the name of an existing geometry field; "
+            f"got {geometry_name!r}"
+        )
+
+    return geom_field_index
+
+
+cdef str get_geometry_field_name(void *ogr_layer, int geom_field_index):
+    """Get the name of a geometry field in a layer by its index.
+
+    Parameters
+    ----------
+    ogr_layer : pointer to open OGR layer
+        The open OGR layer containing the geometry field.
+    geom_field_index : int
+        The index of the geometry field.
+
+    Returns
+    -------
+    str
+        The name of the geometry field (an empty string for nonspatial layers or
+        drivers that do not support custom geometry field names).
+    """
+    cdef void *ogr_featuredef = NULL
+    cdef void *ogr_geomfielddef = NULL
+
+    with nogil:
+        ogr_featuredef = OGR_L_GetLayerDefn(ogr_layer)
+
+    # Nonspatial layers do not have any geometry fields
+    if OGR_FD_GetGeomFieldCount(ogr_featuredef) == 0:
+        return ""
+
+    with nogil:
+        ogr_geomfielddef = OGR_FD_GetGeomFieldDefn(
+            ogr_featuredef, geom_field_index
+        )
+
+    return get_string(OGR_GFld_GetNameRef(ogr_geomfielddef))
+
+
+cdef str get_geometry_type(void *ogr_layer, int geom_field_index):
+    """Get geometry type for a geometry field of a layer.
 
     Parameters
     ----------
     ogr_layer : pointer to open OGR layer
         The open OGR layer to get the geometry type for.
+    geom_field_index : int
+        The index of the geometry field on the layer.
 
     Returns
     -------
@@ -83,7 +166,9 @@ cdef str get_geometry_type(void *ogr_layer):
 
     """
     cdef void *ogr_featuredef = NULL
+    cdef void *ogr_geomfielddef = NULL
     cdef OGRwkbGeometryType ogr_type
+    cdef int geom_field_count
 
     try:
         with nogil:
@@ -95,7 +180,18 @@ cdef str get_geometry_type(void *ogr_layer):
     except CPLE_BaseError as exc:
         raise DataLayerError(str(exc))
 
-    ogr_type = OGR_FD_GetGeomType(ogr_featuredef)
+    # Nonspatial layers do not have any geometry fields
+    geom_field_count = OGR_FD_GetGeomFieldCount(ogr_featuredef)
+    if geom_field_count == 0:
+        return None
+
+    with nogil:
+        ogr_geomfielddef = OGR_FD_GetGeomFieldDefn(
+            ogr_featuredef, geom_field_index
+        )
+    ogr_geomfielddef = check_pointer(ogr_geomfielddef)
+
+    ogr_type = OGR_GFld_GetType(ogr_geomfielddef)
 
     if ogr_type not in GEOMETRY_TYPES:
         raise GeometryError(f"Geometry type is not supported: {ogr_type}")
