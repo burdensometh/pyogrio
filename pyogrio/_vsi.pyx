@@ -1,4 +1,5 @@
 import fnmatch
+import os
 from io import BytesIO
 from uuid import uuid4
 
@@ -142,6 +143,208 @@ cdef read_vsimem_to_buffer(str path, object out_buffer):
     finally:
         if vsi_buffer != NULL:
             CPLFree(vsi_buffer)
+
+
+cpdef str create_vsimem_directory():
+    """Create a fresh empty in-memory directory.
+
+    Caller is responsible for deleting the directory via
+    vsimem_rmtree_toplevel().
+
+    Returns
+    -------
+    str
+        Path to the newly created in-memory directory.
+
+    """
+    cdef str directory = f"/vsimem/pyogrio_{uuid4().hex}"
+
+    if VSIMkdir(directory.encode("UTF-8"), 0666) != 0:
+        raise OSError(f"failed to create in-memory directory '{directory}'")
+
+    return directory
+
+
+cpdef str write_files_to_vsimem(dict files):
+    """Write an explicit group of files into a fresh in-memory directory.
+
+    Each member is stored under its own name in a newly created
+    ``/vsimem/pyogrio_<uuid>/`` directory. The bytes buffers are wrapped
+    zero-copy; they must remain referenced by the caller for as long as the
+    in-memory dataset is in use.
+
+    All input is validated before anything is created, so that invalid input
+    never leaves partial in-memory data behind.
+
+    Caller is responsible for deleting the directory via
+    vsimem_rmtree_toplevel().
+
+    Parameters
+    ----------
+    files : dict
+        Mapping of member file name (``str`` or ``path-like``) to bytes-like
+        buffer. Names must be plain file names without directory components.
+
+    Returns
+    -------
+    str
+        Path to the in-memory directory containing the files.
+
+    """
+    cdef bytes bytes_buffer
+    cdef int num_bytes
+    cdef VSILFILE* vsi_handle = NULL
+    cdef str directory
+    cdef str member
+    cdef str member_path
+
+    if not files:
+        raise ValueError("at least one member file is required")
+
+    # Validate everything up front so that failure does not leave partial
+    # in-memory data behind.
+    normalized = {}
+    for name, buffer in files.items():
+        if not isinstance(name, str):
+            name = os.fspath(name)
+
+        if "/" in name or "\\" in name or name in ("", ".", ".."):
+            raise ValueError(
+                f"member names must be plain file names without directory "
+                f"components: got '{name}'"
+            )
+        member = name
+
+        if isinstance(buffer, bytearray):
+            # VSIFileFromMemBuffer requires a contiguous bytes-like object;
+            # copy bytearray into an immutable bytes object.
+            buffer = bytes(buffer)
+        elif not isinstance(buffer, bytes):
+            raise TypeError(
+                f"buffer for member '{name}' must be bytes or bytearray, "
+                f"got {type(buffer).__name__}"
+            )
+
+        if member in normalized:
+            raise ValueError(f"duplicate member file name: '{member}'")
+
+        normalized[member] = buffer
+
+    directory = create_vsimem_directory()
+
+    try:
+        for member, bytes_buffer in normalized.items():
+            num_bytes = len(bytes_buffer)
+            member_path = f"{directory}/{member}"
+            # NOTE: GDAL does not copy the contents of bytes_buffer; the dict
+            # (and thus the bytes objects) must stay in scope while the file
+            # is in use.
+            vsi_handle = VSIFileFromMemBuffer(
+                member_path.encode("UTF-8"),
+                <unsigned char *>bytes_buffer,
+                num_bytes,
+                0,
+            )
+            if vsi_handle == NULL:
+                raise OSError(
+                    f"failed to write member '{member}' into in-memory directory"
+                )
+
+            if VSIFCloseL(vsi_handle) != 0:
+                raise OSError(
+                    f"failed to close in-memory file for member '{member}'"
+                )
+    except BaseException:
+        # never deliver a partially populated in-memory directory
+        vsimem_rmtree_toplevel(directory)
+        raise
+
+    return directory
+
+
+cdef bytes read_vsimem_file(str path):
+    """Read the full contents of an in-memory file into bytes.
+
+    The in-memory file itself is left untouched; the caller remains
+    responsible for cleaning up the in-memory directory.
+
+    Parameters
+    ----------
+    path : str
+        Path to the in-memory file.
+
+    Returns
+    -------
+    bytes
+        Copy of the file contents.
+
+    """
+    cdef unsigned char *vsi_buffer = NULL
+    cdef vsi_l_offset vsi_buffer_size = 0
+    cdef bytes result
+
+    # take_ownership=0: inspect the buffer without unlinking the file and
+    # without taking ownership; the returned pointer must NOT be freed here
+    vsi_buffer = VSIGetMemFileBuffer(path.encode("UTF-8"), &vsi_buffer_size, 0)
+    if vsi_buffer == NULL:
+        raise RuntimeError(f"could not read bytes from in-memory file '{path}'")
+
+    # slicing copies the contents into a fresh bytes object, so the result
+    # does not depend on GDAL's in-memory buffer
+    result = <bytes>vsi_buffer[:vsi_buffer_size]
+
+    return result
+
+
+cpdef dict read_vsimem_files(str directory):
+    """Read every file directly contained in an in-memory directory.
+
+    Only regular files at the top level of the directory are returned;
+    subdirectories are skipped.
+
+    Parameters
+    ----------
+    directory : str
+        Path to an existing in-memory directory.
+
+    Returns
+    -------
+    dict
+        Mapping of member file name to a bytes copy of its contents.
+
+    """
+    cdef const char *directory_c
+    cdef int n
+    cdef char** papszFiles
+    cdef VSIStatBufL st_buf
+    cdef str member
+    cdef str member_path
+
+    directory_b = directory.encode("UTF-8")
+    directory_c = directory_b
+
+    if not VSIStatL(directory_c, &st_buf) == 0:
+        raise FileNotFoundError(f"Path does not exist: '{directory}'")
+    if not VSI_ISDIR(st_buf.st_mode):
+        raise NotADirectoryError(f"Path is not a directory: '{directory}'")
+
+    try:
+        papszFiles = VSIReadDirRecursive(directory_c)
+        n = CSLCount(<CSLConstList>papszFiles)
+        members = []
+        for i in range(n):
+            member = papszFiles[i].decode("UTF-8")
+            # only read top-level regular files; skip nested directories
+            if "/" in member:
+                continue
+            members.append(member)
+    finally:
+        CSLDestroy(papszFiles)
+
+    if not directory.endswith("/"):
+        directory = f"{directory}/"
+
+    return {member: read_vsimem_file(f"{directory}{member}") for member in members}
 
 
 cpdef vsimem_rmtree_toplevel(str path):

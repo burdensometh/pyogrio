@@ -43,3 +43,19 @@ Arrow integration
 .. autofunction:: pyogrio.read_arrow
 .. autofunction:: pyogrio.open_arrow
 .. autofunction:: pyogrio.write_arrow
+
+In-memory multi-file datasets
+-----------------------------
+
+Some vector formats (e.g. ESRI Shapefile) consist of several sibling files
+with distinct semantics (``.shp``, ``.shx``, ``.dbf``, ``.prj``, ``.cpg``).
+These helpers stage an explicit mapping of member name to bytes buffer in a
+GDAL ``/vsimem/`` directory, without writing the members to a temporary
+directory. The virtual data is removed when the reader or writer is closed.
+
+.. autofunction:: pyogrio.open_virtual_vector_files
+.. autoclass:: pyogrio.VirtualVectorReader
+   :members: path, driver, layer, close
+.. autofunction:: pyogrio.open_virtual_vector_files_for_write
+.. autoclass:: pyogrio.VirtualVectorWriter
+   :members: path, driver, layer, close, close_and_get_files

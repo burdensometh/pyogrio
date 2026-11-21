@@ -2,6 +2,18 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add `open_virtual_vector_files()` / `open_virtual_vector_files_for_write()`
+    to read and write multi-file vector datasets (e.g. ESRI Shapefile) from an
+    explicit mapping of member file name to bytes buffer. The members are staged
+    together in a GDAL `/vsimem/` directory instead of a temporary directory,
+    preserving the original character encoding (`.cpg`) and CRS (`.prj`).
+    Missing required members fail up front, datasets with multiple layers
+    require an explicit `layer`, and the virtual data is cleaned up when the
+    reader or writer is closed. A writer only returns the member group when all
+    required members were produced.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

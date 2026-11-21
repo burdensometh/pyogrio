@@ -31,6 +31,12 @@ from pyogrio.core import (
 )
 from pyogrio.geopandas import read_dataframe, write_dataframe
 from pyogrio.raw import open_arrow, read_arrow, write_arrow
+from pyogrio.virtual import (
+    VirtualVectorReader,
+    VirtualVectorWriter,
+    open_virtual_vector_files,
+    open_virtual_vector_files_for_write,
+)
 
 __version__ = get_versions()["version"]
 del get_versions
@@ -56,6 +62,10 @@ __all__ = [
     "vsi_listtree",
     "vsi_rmtree",
     "vsi_unlink",
+    "VirtualVectorReader",
+    "VirtualVectorWriter",
+    "open_virtual_vector_files",
+    "open_virtual_vector_files_for_write",
     "write_arrow",
     "write_dataframe",
 ]
