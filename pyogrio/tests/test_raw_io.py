@@ -3,6 +3,7 @@ import ctypes
 import json
 import re
 import sys
+import warnings
 from io import BytesIO
 from zipfile import ZipFile
 
@@ -19,19 +20,21 @@ from pyogrio import (
     set_gdal_config_options,
 )
 from pyogrio._compat import GDAL_GE_37, GDAL_GE_313, HAS_PYARROW, HAS_SHAPELY
-from pyogrio.errors import DataLayerError, DataSourceError, FeatureError
-from pyogrio.raw import open_arrow, read, write
+from pyogrio.errors import CRSError, DataLayerError, DataSourceError, FeatureError
+from pyogrio.raw import open_arrow, read, read_arrow, write
 from pyogrio.tests.conftest import (
     DRIVER_EXT,
     DRIVERS,
     prepare_testfile,
     requires_pyarrow_api,
+    requires_pyproj,
     requires_shapely,
 )
 
 import pytest
 
 try:
+    import pyproj
     import shapely
 except ImportError:
     pass
@@ -1493,3 +1496,252 @@ def test_open_arrow_error_no_pyarrow(naturalearth_lowres):
     with pytest.raises(ImportError):
         with open_arrow(naturalearth_lowres, use_pyarrow=True) as _:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Query CRS for bbox / mask spatial filters
+# ---------------------------------------------------------------------------
+
+
+def _projected_point_file(tmp_path, crs="EPSG:3035", name="points.gpkg"):
+    """Create a point layer in a projected CRS, with points on a lon/lat grid."""
+    tr = pyproj.Transformer.from_crs("EPSG:4326", crs, always_xy=True)
+    coords = [(lon + 0.5, lat + 0.5) for lon in range(-40, 41) for lat in range(20, 81)]
+    projected = [tr.transform(lon, lat) for lon, lat in coords]
+    geometry = np.array(
+        [shapely.to_wkb(shapely.Point(x, y)) for x, y in projected], dtype=object
+    )
+    field_data = [np.arange(len(geometry))]
+    path = tmp_path / name
+    write(
+        path,
+        geometry,
+        field_data,
+        fields=["idx"],
+        geometry_type="Point",
+        crs=crs,
+    )
+    return path, coords
+
+
+def _densified_bbox_transform(bbox, src_crs, dst_crs, n_segments=100):
+    """Transform the edges of a bbox to another CRS and return the polygon."""
+    tr = pyproj.Transformer.from_crs(src_crs, dst_crs, always_xy=True)
+    xmin, ymin, xmax, ymax = bbox
+    ring = []
+    for i in range(n_segments):
+        ring.append((xmin + (xmax - xmin) * i / n_segments, ymin))
+    for i in range(n_segments):
+        ring.append((xmax, ymin + (ymax - ymin) * i / n_segments))
+    for i in range(n_segments):
+        ring.append((xmax - (xmax - xmin) * i / n_segments, ymax))
+    for i in range(n_segments):
+        ring.append((xmin, ymax - (ymax - ymin) * i / n_segments))
+    xs, ys = tr.transform([p[0] for p in ring], [p[1] for p in ring])
+    return shapely.Polygon(list(zip(xs, ys)))
+
+
+@requires_pyproj
+@requires_shapely
+def test_read_bbox_crs_matches_native_projected(tmp_path):
+    path, coords = _projected_point_file(tmp_path)
+    query = (-30, 50, 30, 75)
+
+    # independently determine the expected features by transforming the
+    # densified query shape to the layer CRS and intersecting with each point
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
+    query_shape = _densified_bbox_transform(query, "EPSG:4326", "EPSG:3035")
+    expected = {
+        idx
+        for idx, (lon, lat) in enumerate(coords)
+        if query_shape.intersects(shapely.Point(*tr.transform(lon, lat)))
+    }
+
+    fields = read(path, bbox=query, bbox_crs="EPSG:4326")[3][0]
+    assert set(fields.tolist()) == expected
+
+
+def test_read_bbox_crs_equivalent_native_crs(tmp_path):
+    path, _ = _projected_point_file(tmp_path)
+    query = (-30, 50, 30, 75)
+
+    result = read(path, bbox=query, bbox_crs="EPSG:3035")[3][0]
+    expected = read(path, bbox=query)[3][0]
+    assert np.array_equal(np.sort(result), np.sort(expected))
+
+
+def test_read_bbox_crs_is_not_corner_only(tmp_path):
+    """A bbox in another CRS must be transformed as a shape, not just corners.
+
+    Under a non-linear projection the bounding box of the two transformed
+    diagonal corners is a poor approximation: some points inside the shape
+    fall outside that rectangle, and some points outside the shape fall
+    inside it.
+    """
+    path, coords = _projected_point_file(tmp_path)
+    query = (-30, 50, 30, 75)
+
+    result = set(read(path, bbox=query, bbox_crs="EPSG:4326")[3][0].tolist())
+
+    # expected via transforming the densified shape
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
+    shape = _densified_bbox_transform(query, "EPSG:4326", "EPSG:3035")
+    expected = {
+        idx
+        for idx, (lon, lat) in enumerate(coords)
+        if shape.intersects(shapely.Point(*tr.transform(lon, lat)))
+    }
+
+    # corner-only rectangle approximation
+    (x0, y0) = tr.transform(query[0], query[1])
+    (x1, y1) = tr.transform(query[2], query[3])
+    corner_rect = shapely.box(min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+    corner_expected = {
+        idx
+        for idx, (lon, lat) in enumerate(coords)
+        if corner_rect.intersects(shapely.Point(*tr.transform(lon, lat)))
+    }
+
+    assert result == expected
+    # the two approximations must actually differ, otherwise the test is useless
+    assert corner_expected != expected
+
+
+def test_read_bbox_crs_keeps_layer_crs(tmp_path):
+    path, _ = _projected_point_file(tmp_path)
+    meta, _, geometry, _ = read(path, bbox=(-30, 50, 30, 75), bbox_crs="EPSG:4326")
+
+    assert meta["crs"] == "EPSG:3035"
+    # returned geometry is still in the layer CRS
+    geometries = shapely.from_wkb(geometry)
+    assert shapely.get_coordinate_dimension(geometries)[0] == 2
+    assert np.abs(shapely.get_x(geometries)).min() > 1000  # metres, not degrees
+
+
+def test_read_bbox_crs_axis_order_is_xy(tmp_path):
+    # Query coordinates are always interpreted as x, y, even for a CRS whose
+    # authority-defined axis order is y, x.
+    path, _ = _projected_point_file(tmp_path, crs="EPSG:4326")
+
+    # query bbox around (0.5, 20.5) in lon, lat
+    result = read(path, bbox=(-1, 19, 2, 22), bbox_crs="EPSG:4326")[3][0]
+    assert len(result) > 0
+
+    # if the query were interpreted as lat, lon, this region would be empty
+    swapped = read(path, bbox=(19, -1, 22, 2), bbox_crs="EPSG:4326")[3][0]
+    assert len(swapped) == 0
+
+
+@requires_shapely
+def test_read_mask_crs(tmp_path):
+    path, _ = _projected_point_file(tmp_path)
+    query = shapely.box(-30, 50, 30, 75)
+
+    result = read(path, mask=query, mask_crs="EPSG:4326")[3][0]
+    projected_mask = shapely.transform(
+        query,
+        lambda a: np.column_stack(
+            pyproj.Transformer.from_crs(
+                "EPSG:4326", "EPSG:3035", always_xy=True
+            ).transform(a[:, 0], a[:, 1])
+        ),
+    )
+    expected = read(path, mask=projected_mask)[3][0]
+    assert np.array_equal(np.sort(result), np.sort(expected))
+
+
+def test_read_bbox_crs_invalid_crs(naturalearth_lowres):
+    with pytest.raises(CRSError, match="Could not set CRS"):
+        read(naturalearth_lowres, bbox=(0, 0, 1, 1), bbox_crs="not a crs")
+
+
+def test_read_bbox_crs_without_crs_parameter(naturalearth_lowres):
+    with pytest.raises(
+        ValueError, match="'bbox_crs' can only be used in combination with 'bbox'"
+    ):
+        read(naturalearth_lowres, bbox_crs="EPSG:4326")
+
+
+def test_read_mask_crs_without_mask_parameter(naturalearth_lowres):
+    with pytest.raises(
+        ValueError, match="'mask_crs' can only be used in combination with 'mask'"
+    ):
+        read(naturalearth_lowres, mask_crs="EPSG:4326")
+
+
+def test_read_bbox_crs_invalid_type(naturalearth_lowres):
+    with pytest.raises(ValueError, match="Invalid bbox_crs"):
+        read(naturalearth_lowres, bbox=(0, 0, 1, 1), bbox_crs=4326)
+
+
+def test_read_mask_crs_invalid_type(naturalearth_lowres):
+    with pytest.raises(ValueError, match="Invalid mask_crs"):
+        read(naturalearth_lowres, mask=shapely.Point(0, 0), mask_crs=4326)
+
+
+def test_read_bbox_crs_no_layer_crs(tmp_path):
+    # GeoJSON written without CRS would still get a placeholder CRS by GDAL,
+    # so use a shapefile without .prj
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        path = tmp_path / "nocrs.shp"
+        write(
+            path,
+            np.array([shapely.to_wkb(shapely.Point(1, 1))], dtype=object),
+            [np.array([1])],
+            fields=["a"],
+            geometry_type="Point",
+        )
+
+    with pytest.raises(CRSError, match="does not have a valid CRS"):
+        read(path, bbox=(0, 0, 2, 2), bbox_crs="EPSG:4326")
+
+    with pytest.raises(CRSError, match="does not have a valid CRS"):
+        read(path, mask=shapely.Point(1, 1), mask_crs="EPSG:4326")
+
+
+def test_read_bbox_crs_untransformable(tmp_path):
+    # latitude > 90 cannot be transformed from EPSG:4326 to a projected CRS
+    path, _ = _projected_point_file(tmp_path)
+    with pytest.raises(CRSError, match="Could not transform the bbox"):
+        read(path, bbox=(0, 0, 10, 95), bbox_crs="EPSG:4326")
+
+
+@requires_shapely
+def test_read_mask_crs_untransformable(tmp_path):
+    path, _ = _projected_point_file(tmp_path)
+    mask = shapely.box(0, 0, 10, 95)
+    with pytest.raises(CRSError, match="Could not transform the mask"):
+        read(path, mask=mask, mask_crs="EPSG:4326")
+
+
+def test_read_bbox_crs_arrow(naturalearth_lowres):
+    result = read_arrow(
+        naturalearth_lowres, bbox=(-85, 8, -80, 10), bbox_crs="EPSG:4326"
+    )
+    assert result[1]["iso_a3"].to_pylist() == ["PAN", "CRI"]
+
+
+@requires_shapely
+def test_read_mask_crs_arrow(naturalearth_lowres):
+    result = read_arrow(
+        naturalearth_lowres, mask=shapely.box(-85, 8, -80, 10), mask_crs="EPSG:4326"
+    )
+    assert result[1]["iso_a3"].to_pylist() == ["PAN", "CRI"]
+
+
+def test_read_arrow_bbox_crs_untransformable(tmp_path):
+    path, _ = _projected_point_file(tmp_path)
+    with pytest.raises(CRSError, match="Could not transform the bbox"):
+        read_arrow(path, bbox=(0, 0, 10, 95), bbox_crs="EPSG:4326")
+
+
+def test_open_arrow_bbox_crs(naturalearth_lowres):
+    with open_arrow(
+        naturalearth_lowres,
+        bbox=(-85, 8, -80, 10),
+        bbox_crs="EPSG:4326",
+        use_pyarrow=True,
+    ) as (meta, reader):
+        assert meta["crs"] == "EPSG:4326"
+        assert sum(len(batch) for batch in reader) == 2

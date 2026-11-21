@@ -24,12 +24,13 @@ from pyogrio import (
 from pyogrio._compat import GDAL_GE_38, GDAL_GE_311, GDAL_GE_312
 from pyogrio._env import GDALEnv
 from pyogrio.core import list_drivers_details
-from pyogrio.errors import DataLayerError, DataSourceError
+from pyogrio.errors import CRSError, DataLayerError, DataSourceError
 from pyogrio.raw import read, write
 from pyogrio.tests.conftest import (
     DRIVERS,
     START_FID,
     prepare_testfile,
+    requires_pyproj,
     requires_shapely,
 )
 
@@ -834,3 +835,82 @@ def test_vsi_curl_clear_cache_empty_default():
 def test_vsi_curl_clear_cache():
     # Validate call doesn't raise any error when prefix/path is used
     vsi_curl_clear_cache("http://example.com/prefix")
+
+
+# ---------------------------------------------------------------------------
+# Query CRS for bbox / mask spatial filters
+# ---------------------------------------------------------------------------
+
+
+def test_read_bounds_bbox_crs_equivalent(naturalearth_lowres):
+    fids_crs, bounds_crs = read_bounds(
+        naturalearth_lowres, bbox=(-85, 8, -80, 10), bbox_crs="EPSG:4326"
+    )
+    fids, bounds = read_bounds(naturalearth_lowres, bbox=(-85, 8, -80, 10))
+
+    assert array_equal(fids_crs, fids)
+    assert allclose(bounds_crs, bounds)
+
+
+@requires_pyproj
+@requires_shapely
+def test_read_bounds_bbox_crs_projected(tmp_path):
+    import pyproj
+
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3035", always_xy=True)
+    coords = [(lon + 0.5, lat + 0.5) for lon in range(-40, 41) for lat in range(20, 81)]
+    geometry = np.array(
+        [shapely.to_wkb(shapely.Point(*tr.transform(lon, lat))) for lon, lat in coords],
+        dtype=object,
+    )
+    path = tmp_path / "points.gpkg"
+    write(
+        path,
+        geometry,
+        [np.arange(len(geometry))],
+        fields=["idx"],
+        crs="EPSG:3035",
+        geometry_type="Point",
+    )
+
+    query = (-30, 50, 30, 75)
+    fids, bounds = read_bounds(path, bbox=query, bbox_crs="EPSG:4326")
+
+    # results must match the read of the same filter
+    expected_fids = read(path, bbox=query, bbox_crs="EPSG:4326", return_fids=True)[1]
+    assert set(fids.tolist()) == set(expected_fids.tolist())
+    # bounds are still in the layer CRS (metres, not degrees)
+    assert bounds.shape == (4, len(fids))
+    assert np.abs(bounds).min() > 1000
+
+
+@requires_shapely
+def test_read_bounds_mask_crs(naturalearth_lowres):
+    mask = shapely.box(-85, 8, -80, 10)
+    fids_crs, bounds_crs = read_bounds(
+        naturalearth_lowres, mask=mask, mask_crs="EPSG:4326"
+    )
+    fids, bounds = read_bounds(naturalearth_lowres, mask=mask)
+
+    assert array_equal(fids_crs, fids)
+    assert allclose(bounds_crs, bounds)
+
+
+def test_read_bounds_bbox_crs_invalid(naturalearth_lowres):
+    with pytest.raises(CRSError, match="Could not set CRS"):
+        read_bounds(naturalearth_lowres, bbox=(0, 0, 1, 1), bbox_crs="not a crs")
+
+
+def test_read_bounds_bbox_crs_without_bbox(naturalearth_lowres):
+    with pytest.raises(
+        ValueError, match="'bbox_crs' can only be used in combination with 'bbox'"
+    ):
+        read_bounds(naturalearth_lowres, bbox_crs="EPSG:4326")
+
+
+@requires_shapely
+def test_read_bounds_mask_crs_without_mask(naturalearth_lowres):
+    with pytest.raises(
+        ValueError, match="'mask_crs' can only be used in combination with 'mask'"
+    ):
+        read_bounds(naturalearth_lowres, mask_crs="EPSG:4326")

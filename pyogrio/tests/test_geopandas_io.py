@@ -1543,6 +1543,95 @@ def test_read_mask(
     assert np.array_equal(df.iso_a3, expected)
 
 
+def test_read_bbox_crs(naturalearth_lowres_all_ext, use_arrow):
+    df = read_dataframe(
+        naturalearth_lowres_all_ext,
+        use_arrow=use_arrow,
+        bbox=(-85, 8, -80, 10),
+        bbox_crs="EPSG:4326",
+    )
+    assert np.array_equal(df.iso_a3, ["PAN", "CRI"])
+    # the CRS of the returned geometries is that of the layer
+    assert df.crs == "EPSG:4326"
+
+
+@requires_pyproj
+def test_read_bbox_crs_projected(naturalearth_lowres_all_ext, use_arrow):
+    # The layer is in EPSG:4326; express the same query bbox in a projected CRS
+    bbox = (-85, 8, -80, 10)
+    import pyproj
+
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+    x0, y0 = tr.transform(bbox[0], bbox[1])
+    x1, y1 = tr.transform(bbox[2], bbox[3])
+
+    expected = read_dataframe(
+        naturalearth_lowres_all_ext, use_arrow=use_arrow, bbox=bbox
+    )
+    result = read_dataframe(
+        naturalearth_lowres_all_ext,
+        use_arrow=use_arrow,
+        bbox=(x0, y0, x1, y1),
+        bbox_crs="EPSG:3857",
+    )
+
+    assert np.array_equal(result.iso_a3, expected.iso_a3)
+    assert result.crs == "EPSG:4326"
+
+
+@requires_pyproj
+def test_read_mask_crs_projected(naturalearth_lowres_all_ext, use_arrow):
+    mask = shapely.box(-85, 8, -80, 10)
+    import pyproj
+
+    tr = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True)
+
+    def _project(coords):
+        x, y = tr.transform(coords[:, 0], coords[:, 1])
+        return np.column_stack([x, y])
+
+    mask_projected = shapely.transform(mask, _project)
+
+    expected = read_dataframe(
+        naturalearth_lowres_all_ext, use_arrow=use_arrow, mask=mask
+    )
+    result = read_dataframe(
+        naturalearth_lowres_all_ext,
+        use_arrow=use_arrow,
+        mask=mask_projected,
+        mask_crs="EPSG:3857",
+    )
+
+    assert np.array_equal(result.iso_a3, expected.iso_a3)
+    assert result.crs == "EPSG:4326"
+
+
+def test_read_bbox_crs_invalid_crs(naturalearth_lowres, use_arrow):
+    from pyogrio.errors import CRSError
+
+    with pytest.raises(CRSError, match="Could not set CRS"):
+        read_dataframe(
+            naturalearth_lowres,
+            use_arrow=use_arrow,
+            bbox=(0, 0, 1, 1),
+            bbox_crs="not a crs",
+        )
+
+
+def test_read_bbox_crs_without_bbox(naturalearth_lowres, use_arrow):
+    with pytest.raises(
+        ValueError, match="'bbox_crs' can only be used in combination with 'bbox'"
+    ):
+        read_dataframe(naturalearth_lowres, use_arrow=use_arrow, bbox_crs="EPSG:4326")
+
+
+def test_read_mask_crs_without_mask(naturalearth_lowres, use_arrow):
+    with pytest.raises(
+        ValueError, match="'mask_crs' can only be used in combination with 'mask'"
+    ):
+        read_dataframe(naturalearth_lowres, use_arrow=use_arrow, mask_crs="EPSG:4326")
+
+
 def test_read_mask_sql(naturalearth_lowres_all_ext, use_arrow):
     df = read_dataframe(
         naturalearth_lowres_all_ext,

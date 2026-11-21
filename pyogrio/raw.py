@@ -48,7 +48,9 @@ def read(
     max_features=None,
     where=None,
     bbox=None,
+    bbox_crs=None,
     mask=None,
+    mask_crs=None,
     fids=None,
     sql=None,
     sql_dialect=None,
@@ -104,19 +106,41 @@ def read(
         Examples: ``"ISO_A3 = 'CAN'"``, ``"POP_EST > 10000000 AND POP_EST < 100000000"``
     bbox : tuple of (xmin, ymin, xmax, ymax), optional (default: None)
         If present, will be used to filter records whose geometry intersects this
-        box.  This must be in the same CRS as the dataset.  If GEOS is present
-        and used by GDAL, only geometries that intersect this bbox will be
-        returned; if GEOS is not available or not used by GDAL, all geometries
-        with bounding boxes that intersect this bbox will be returned.
+        box.  This must be in the same CRS as the dataset unless ``bbox_crs`` is
+        specified.  If GEOS is present and used by GDAL, only geometries that
+        intersect this bbox will be returned; if GEOS is not available or not used
+        by GDAL, all geometries with bounding boxes that intersect this bbox will
+        be returned.
         Cannot be combined with ``mask`` keyword.
+    bbox_crs : str, optional (default: None)
+        CRS in which ``bbox`` is defined.  If specified, the bounding box is
+        transformed to the CRS of the dataset before it is used as a spatial
+        filter.  The coordinates of ``bbox`` are always interpreted as ``x``,
+        ``y`` in this CRS (i.e. the axis order mandated by the CRS is ignored).
+        This requires the dataset layer to have a valid CRS and a coordinate
+        transformation between both CRS to be available; otherwise a
+        ``CRSError`` is raised.
+
+        .. versionadded:: 0.14.0
     mask : Shapely geometry, optional (default: None)
         If present, will be used to filter records whose geometry intersects
-        this geometry.  This must be in the same CRS as the dataset.  If GEOS is
-        present and used by GDAL, only geometries that intersect this geometry
-        will be returned; if GEOS is not available or not used by GDAL, all
-        geometries with bounding boxes that intersect the bounding box of this
-        geometry will be returned.  Requires Shapely >= 2.0.
+        this geometry.  This must be in the same CRS as the dataset unless
+        ``mask_crs`` is specified.  If GEOS is present and used by GDAL, only
+        geometries that intersect this geometry will be returned; if GEOS is not
+        available or not used by GDAL, all geometries with bounding boxes that
+        intersect the bounding box of this geometry will be returned.  Requires
+        Shapely >= 2.0.
         Cannot be combined with ``bbox`` keyword.
+    mask_crs : str, optional (default: None)
+        CRS in which ``mask`` is defined.  If specified, the mask geometry is
+        transformed to the CRS of the dataset before it is used as a spatial
+        filter.  The coordinates of ``mask`` are always interpreted as ``x``,
+        ``y`` in this CRS (i.e. the axis order mandated by the CRS is ignored).
+        This requires the dataset layer to have a valid CRS and a coordinate
+        transformation between both CRS to be available; otherwise a
+        ``CRSError`` is raised.
+
+        .. versionadded:: 0.14.0
     fids : array-like, optional (default: None)
         Array of integer feature id (FID) values to select. Cannot be combined
         with other keywords to select a subset (``skip_features``,
@@ -208,7 +232,9 @@ def read(
         max_features=max_features or 0,
         where=where,
         bbox=bbox,
+        bbox_crs=bbox_crs,
         mask=_mask_to_wkb(mask),
+        mask_crs=mask_crs,
         fids=fids,
         sql=sql,
         sql_dialect=sql_dialect,
@@ -230,7 +256,9 @@ def read_arrow(
     max_features=None,
     where=None,
     bbox=None,
+    bbox_crs=None,
     mask=None,
+    mask_crs=None,
     fids=None,
     sql=None,
     sql_dialect=None,
@@ -302,7 +330,9 @@ def read_arrow(
         force_2d=force_2d,
         where=where,
         bbox=bbox,
+        bbox_crs=bbox_crs,
         mask=mask,
+        mask_crs=mask_crs,
         fids=fids,
         sql=sql,
         sql_dialect=sql_dialect,
@@ -359,7 +389,9 @@ def open_arrow(
     max_features=None,
     where=None,
     bbox=None,
+    bbox_crs=None,
     mask=None,
+    mask_crs=None,
     fids=None,
     sql=None,
     sql_dialect=None,
@@ -458,7 +490,9 @@ def open_arrow(
         max_features=max_features or 0,
         where=where,
         bbox=bbox,
+        bbox_crs=bbox_crs,
         mask=_mask_to_wkb(mask),
+        mask_crs=mask_crs,
         fids=fids,
         sql=sql,
         sql_dialect=sql_dialect,

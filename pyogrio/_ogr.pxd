@@ -208,6 +208,7 @@ cdef extern from "ogr_core.h":
 
 cdef extern from "ogr_srs_api.h":
     ctypedef void* OGRSpatialReferenceH
+    ctypedef void* OGRCoordinateTransformationH
 
     int                     OSRAutoIdentifyEPSG(OGRSpatialReferenceH srs)
     OGRErr                  OSRExportToWkt(OGRSpatialReferenceH srs, char **params)
@@ -225,7 +226,15 @@ cdef extern from "ogr_srs_api.h":
                                                 const char *pszDef)
     void                    OSRSetPROJSearchPaths(const char *const *paths)
     OGRSpatialReferenceH    OSRNewSpatialReference(const char *wkt)
+    OGRSpatialReferenceH    OSRClone(OGRSpatialReferenceH srs)
+    int                     OSRIsSame(OGRSpatialReferenceH lhs,
+                                      OGRSpatialReferenceH rhs)
     void                    OSRRelease(OGRSpatialReferenceH srs)
+
+    OGRCoordinateTransformationH OCTNewCoordinateTransformation(
+        OGRSpatialReferenceH hSourceSRS, OGRSpatialReferenceH hTargetSRS)
+    void                    OCTDestroyCoordinateTransformation(
+        OGRCoordinateTransformationH hTransform)
 
 
 cdef extern from "arrow_bridge.h" nogil:
@@ -362,6 +371,16 @@ cdef extern from "ogr_api.h":
                                           unsigned char *buffer)
     void                OGR_G_GetEnvelope(OGRGeometryH geometry, OGREnvelope* envelope)
     OGRwkbGeometryType  OGR_G_GetGeometryType(OGRGeometryH)
+    int                 OGR_G_GetPointCount(OGRGeometryH geometry)
+    int                 OGR_G_GetPoints(OGRGeometryH geometry,
+                                        void *pabyX, int nXStride,
+                                        void *pabyY, int nYStride,
+                                        void *pabyZ, int nZStride)
+    int                 OGR_G_GetGeometryCount(OGRGeometryH geometry)
+    OGRGeometryH        OGR_G_GetGeometryRef(OGRGeometryH geometry, int i) nogil
+    OGRErr              OGR_G_AddGeometryDirectly(OGRGeometryH geometry,
+                                                  OGRGeometryH newSubGeom)
+    void                OGR_G_AddPoint_2D(OGRGeometryH geometry, double x, double y)
     OGRGeometryH        OGR_G_GetLinearGeometry(OGRGeometryH hGeom,
                                                 double dfMaxAngleStepSizeDegrees,
                                                 char **papszOptions)
@@ -373,6 +392,8 @@ cdef extern from "ogr_api.h":
     int                 OGR_G_Is3D(OGRGeometryH geometry)
     void                OGR_G_Set3D(OGRGeometryH geometry, int is3D)
     int                 OGR_G_WkbSize(OGRGeometryH geometry)
+    OGRErr              OGR_G_Transform(OGRGeometryH geometry,
+                                        OGRCoordinateTransformationH hTransform)
     OGRGeometryH        OGR_G_ForceToMultiPoint(OGRGeometryH geometry)
     OGRGeometryH        OGR_G_ForceToMultiLineString(OGRGeometryH geometry)
     OGRGeometryH        OGR_G_ForceToMultiPolygon(OGRGeometryH geometry)

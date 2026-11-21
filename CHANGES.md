@@ -2,6 +2,19 @@
 
 ## 0.14.0 (yyyy-mm-dd)
 
+### Improvements
+
+-   Add ``bbox_crs`` and ``mask_crs`` parameters to `read`, `read_arrow`,
+    `open_arrow`, `read_bounds` and `read_dataframe` to specify the CRS of the
+    ``bbox`` or ``mask`` spatial filter when it differs from the CRS of the
+    dataset. The filter shape is transformed to the CRS of the layer before it
+    is applied, using a densified shape rather than only the two diagonal
+    corners so that non-linear projections are handled correctly. Query
+    coordinates are always interpreted as x, y (ignoring the axis order
+    mandated by the CRS). A `CRSError` is raised if the layer has no CRS or if
+    the shape cannot be transformed. The geometries that are read remain in
+    the CRS of the layer.
+
 ### Packaging
 
 -   The macOS and Linux wheels no longer export the symbols of the libraries

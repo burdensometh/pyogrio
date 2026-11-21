@@ -15,7 +15,7 @@ IF CTE_GDAL_VERSION < (3, 8, 0):
 
 from libc.stdint cimport uint8_t, uintptr_t
 from libc.stdlib cimport malloc, free
-from libc.math cimport isnan, modff
+from libc.math cimport isfinite, isnan, modff
 from cpython.pycapsule cimport PyCapsule_GetPointer
 
 cimport cython
@@ -859,7 +859,7 @@ cdef apply_where_filter(OGRLayerH ogr_layer, str where):
         )
 
 
-cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
+cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox, object bbox_crs=None):
     """Applies bounding box spatial filter to layer.
 
     Parameters
@@ -868,23 +868,50 @@ cdef apply_bbox_filter(OGRLayerH ogr_layer, bbox):
         The open OGR layer to apply the filter to
     bbox : list or tuple of xmin, ymin, xmax, ymax
         Bounding box to filter on
+    bbox_crs : str, optional (default: None)
+        CRS in which ``bbox`` is defined. If provided, the bounding box is
+        transformed to the CRS of the layer before the filter is applied.
+        The coordinates of ``bbox`` are always interpreted as x, y in that
+        CRS (i.e. ignoring any authority-mandated axis order).
 
     Raises
     ------
     ValueError: if bbox is not a list or tuple or does not have proper number of
         items
+    CRSError: if the bbox cannot be transformed to the CRS of the layer
     """
     cdef double xmin, ymin, xmax, ymax
+    cdef OGRGeometryH ogr_geometry = NULL
 
     if not (isinstance(bbox, (tuple, list)) and len(bbox) == 4):
         raise ValueError(f"Invalid bbox: {bbox}")
 
     xmin, ymin, xmax, ymax = bbox
-    with nogil:
-        OGR_L_SetSpatialFilterRect(ogr_layer, xmin, ymin, xmax, ymax)
+
+    if not (isfinite(xmin) and isfinite(ymin) and isfinite(xmax) and isfinite(ymax)):
+        raise ValueError(f"Invalid bbox: {bbox}; coordinates must be finite")
+
+    if bbox_crs is None or crs_matches_layer(ogr_layer, bbox_crs):
+        with nogil:
+            OGR_L_SetSpatialFilterRect(ogr_layer, xmin, ymin, xmax, ymax)
+        return
+
+    # Transform the bounding box as a shape instead of transforming only the
+    # two diagonal corners: under non-linear projections the transformed
+    # bounding box is not a rectangle, so its edges need to be densified and
+    # every vertex transformed. The resulting geometry is used as the spatial
+    # filter rather than its (over-approximating) bounding box.
+    ogr_geometry = create_bbox_geometry(xmin, ymin, xmax, ymax)
+    try:
+        transform_geometry(ogr_geometry, ogr_layer, bbox_crs, "bbox")
+        with nogil:
+            OGR_L_SetSpatialFilter(ogr_layer, ogr_geometry)
+    finally:
+        if ogr_geometry != NULL:
+            OGR_G_DestroyGeometry(ogr_geometry)
 
 
-cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
+cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb, object mask_crs=None):
     """Applies geometry spatial filter to the layer.
 
     Parameters
@@ -893,6 +920,15 @@ cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
         The open OGR layer
     wkb : bytes
         Geometry encoded as WKB
+    mask_crs : str, optional (default: None)
+        CRS in which the mask geometry is defined. If provided, the mask is
+        transformed to the CRS of the layer before the filter is applied.
+        The coordinates of the mask are always interpreted as x, y in that
+        CRS (i.e. ignoring any authority-mandated axis order).
+
+    Raises
+    ------
+    CRSError: if the mask cannot be transformed to the CRS of the layer
     """
     cdef OGRGeometryH ogr_geometry = NULL
     cdef unsigned char *wkb_buffer = wkb
@@ -903,9 +939,278 @@ cdef apply_geometry_filter(OGRLayerH ogr_layer, wkb):
             OGR_G_DestroyGeometry(ogr_geometry)
         raise GeometryError("Could not create mask geometry") from None
 
-    with nogil:
-        OGR_L_SetSpatialFilter(ogr_layer, ogr_geometry)
-    OGR_G_DestroyGeometry(ogr_geometry)
+    try:
+        if mask_crs is not None and not crs_matches_layer(ogr_layer, mask_crs):
+            transform_geometry(ogr_geometry, ogr_layer, mask_crs, "mask")
+
+        with nogil:
+            OGR_L_SetSpatialFilter(ogr_layer, ogr_geometry)
+    finally:
+        OGR_G_DestroyGeometry(ogr_geometry)
+
+
+cdef OGRGeometryH create_bbox_geometry(
+    double xmin, double ymin, double xmax, double ymax
+) except NULL:
+    """Create a polygon from a bounding box with densified edges.
+
+    Each edge is subdivided in a fixed number of segments so that the shape
+    can be transformed accurately under non-linear projections.
+
+    Returns
+    -------
+    OGRGeometryH
+        Polygon geometry representing the bounding box
+    """
+    cdef OGRGeometryH ogr_ring = NULL
+    cdef OGRGeometryH ogr_polygon = NULL
+    cdef int n_segments = 100
+    cdef int i
+    cdef OGRErr err
+
+    ogr_ring = OGR_G_CreateGeometry(wkbLinearRing)
+    if ogr_ring == NULL:
+        raise GeometryError("Could not create bbox geometry") from None
+
+    ogr_polygon = OGR_G_CreateGeometry(wkbPolygon)
+    if ogr_polygon == NULL:
+        OGR_G_DestroyGeometry(ogr_ring)
+        raise GeometryError("Could not create bbox geometry") from None
+
+    try:
+        for i in range(n_segments):
+            OGR_G_AddPoint_2D(
+                ogr_ring, xmin + (xmax - xmin) * i / n_segments, ymin
+            )
+        for i in range(n_segments):
+            OGR_G_AddPoint_2D(
+                ogr_ring, xmax, ymin + (ymax - ymin) * i / n_segments
+            )
+        for i in range(n_segments):
+            OGR_G_AddPoint_2D(
+                ogr_ring, xmax - (xmax - xmin) * i / n_segments, ymax
+            )
+        for i in range(n_segments):
+            OGR_G_AddPoint_2D(
+                ogr_ring, xmin, ymax - (ymax - ymin) * i / n_segments
+            )
+        # close the ring
+        OGR_G_AddPoint_2D(ogr_ring, xmin, ymin)
+
+        err = OGR_G_AddGeometryDirectly(ogr_polygon, ogr_ring)
+        if err != OGRERR_NONE:
+            raise GeometryError("Could not create bbox geometry") from None
+
+        # ownership of the ring has been transferred to the polygon
+        ogr_ring = NULL
+
+    except BaseException:
+        if ogr_ring != NULL:
+            OGR_G_DestroyGeometry(ogr_ring)
+        OGR_G_DestroyGeometry(ogr_polygon)
+        raise
+
+    return ogr_polygon
+
+
+cdef OGRSpatialReferenceH get_layer_spatial_ref(OGRLayerH ogr_layer) except NULL:
+    """Return the (borrowed) spatial reference of the layer.
+
+    Parameters
+    ----------
+    ogr_layer : OGRLayerH
+        The open OGR layer
+
+    Raises
+    ------
+    CRSError
+        if the layer does not have a valid CRS
+
+    Returns
+    -------
+    OGRSpatialReferenceH
+        The spatial reference of the layer (borrowed, do not release)
+    """
+    cdef OGRSpatialReferenceH ogr_crs = OGR_L_GetSpatialRef(ogr_layer)
+    if ogr_crs == NULL:
+        raise CRSError(
+            "Cannot transform the spatial filter: the dataset layer does not "
+            "have a valid CRS"
+        ) from None
+
+    return ogr_crs
+
+
+cdef bint crs_matches_layer(OGRLayerH ogr_layer, str crs) except -1:
+    """Check whether ``crs`` is equivalent to the CRS of the layer.
+
+    Parameters
+    ----------
+    ogr_layer : OGRLayerH
+        The open OGR layer
+    crs : str
+        CRS to compare against the CRS of the layer
+
+    Raises
+    ------
+    CRSError
+        if the layer does not have a valid CRS or if ``crs`` cannot be parsed
+
+    Returns
+    -------
+    bint
+        True if both CRS are equivalent, False otherwise
+    """
+    cdef OGRSpatialReferenceH ogr_layer_crs = NULL
+    cdef OGRSpatialReferenceH ogr_layer_crs_clone = NULL
+    cdef OGRSpatialReferenceH ogr_query_crs = NULL
+    cdef int is_same
+
+    try:
+        ogr_layer_crs = get_layer_spatial_ref(ogr_layer)
+        ogr_layer_crs_clone = OSRClone(ogr_layer_crs)
+        if ogr_layer_crs_clone == NULL:
+            raise CRSError(
+                "Cannot compare with the CRS of the dataset layer: could not "
+                "read its CRS"
+            ) from None
+
+        ogr_query_crs = create_crs(crs)
+        # Ignore axis-order differences: the query coordinates are always
+        # interpreted as x, y, so only the underlying CRS definition matters.
+        OSRSetAxisMappingStrategy(ogr_layer_crs_clone, OAMS_TRADITIONAL_GIS_ORDER)
+        OSRSetAxisMappingStrategy(ogr_query_crs, OAMS_TRADITIONAL_GIS_ORDER)
+        is_same = OSRIsSame(ogr_layer_crs_clone, ogr_query_crs)
+
+    finally:
+        if ogr_query_crs != NULL:
+            OSRRelease(ogr_query_crs)
+        if ogr_layer_crs_clone != NULL:
+            OSRRelease(ogr_layer_crs_clone)
+
+    return is_same == 1
+
+
+cdef transform_geometry(
+    OGRGeometryH ogr_geometry, OGRLayerH ogr_layer, str crs, str name
+):
+    """Transform a geometry from ``crs`` to the CRS of the layer in-place.
+
+    Parameters
+    ----------
+    ogr_geometry : OGRGeometryH
+        The geometry to transform (modified in place)
+    ogr_layer : OGRLayerH
+        The open OGR layer, used to determine the target CRS
+    crs : str
+        CRS in which the geometry is defined
+    name : str
+        Name of the filter ("bbox" or "mask"), used in error messages
+
+    Raises
+    ------
+    CRSError
+        if the layer has no valid CRS, if ``crs`` is invalid, if a coordinate
+        transformation could not be created, or if the geometry could not be
+        transformed (e.g. coordinates outside the domain of the projection)
+    """
+    cdef OGRSpatialReferenceH ogr_layer_crs = NULL
+    cdef OGRSpatialReferenceH ogr_source_crs = NULL
+    cdef OGRSpatialReferenceH ogr_target_crs = NULL
+    cdef OGRCoordinateTransformationH ogr_transform = NULL
+    cdef OGRErr err
+
+    ogr_layer_crs = get_layer_spatial_ref(ogr_layer)
+    ogr_source_crs = create_crs(crs)
+
+    try:
+        ogr_target_crs = OSRClone(ogr_layer_crs)
+        if ogr_target_crs == NULL:
+            raise CRSError(
+                "Cannot transform the spatial filter: could not read the CRS "
+                "of the dataset layer"
+            ) from None
+
+        # Always interpret the query coordinates as x, y, regardless of any
+        # authority-mandated axis order of the CRS.
+        OSRSetAxisMappingStrategy(ogr_source_crs, OAMS_TRADITIONAL_GIS_ORDER)
+        OSRSetAxisMappingStrategy(ogr_target_crs, OAMS_TRADITIONAL_GIS_ORDER)
+
+        ogr_transform = OCTNewCoordinateTransformation(
+            ogr_source_crs, ogr_target_crs
+        )
+        if ogr_transform == NULL:
+            raise CRSError(
+                f"Could not create a coordinate transformation to transform "
+                f"the {name} from CRS {crs!r} to the CRS of the dataset"
+            ) from None
+
+        err = OGR_G_Transform(ogr_geometry, ogr_transform)
+        if err != OGRERR_NONE:
+            raise CRSError(
+                f"Could not transform the {name} from CRS {crs!r} to the CRS "
+                f"of the dataset"
+            ) from None
+
+    finally:
+        if ogr_transform != NULL:
+            OCTDestroyCoordinateTransformation(ogr_transform)
+        if ogr_source_crs != NULL:
+            OSRRelease(ogr_source_crs)
+        if ogr_target_crs != NULL:
+            OSRRelease(ogr_target_crs)
+
+    if geometry_has_non_finite(ogr_geometry):
+        raise CRSError(
+            f"Could not transform the {name} from CRS {crs!r} to the CRS of "
+            f"the dataset: the result contains invalid coordinates"
+        ) from None
+
+
+cdef int geometry_has_non_finite(OGRGeometryH ogr_geometry) except -1:
+    """Check whether a geometry contains non-finite (NaN / inf) coordinates.
+
+    Returns
+    -------
+    int
+        1 if any coordinate is not finite, 0 otherwise
+    """
+    cdef int n_points = OGR_G_GetPointCount(ogr_geometry)
+    cdef int n_geometries = OGR_G_GetGeometryCount(ogr_geometry)
+    cdef int i
+    cdef double *xs = NULL
+    cdef double *ys = NULL
+    cdef int result = 0
+
+    if n_points > 0:
+        xs = <double *>malloc(n_points * sizeof(double))
+        ys = <double *>malloc(n_points * sizeof(double))
+        if xs == NULL or ys == NULL:
+            if xs != NULL:
+                free(xs)
+            if ys != NULL:
+                free(ys)
+            raise MemoryError("Could not allocate memory to validate geometry")
+
+        try:
+            OGR_G_GetPoints(
+                ogr_geometry, xs, sizeof(double), ys, sizeof(double), NULL, 0
+            )
+            for i in range(n_points):
+                if not (isfinite(xs[i]) and isfinite(ys[i])):
+                    result = 1
+                    break
+        finally:
+            free(xs)
+            free(ys)
+
+    if not result:
+        for i in range(n_geometries):
+            if geometry_has_non_finite(OGR_G_GetGeometryRef(ogr_geometry, i)):
+                result = 1
+                break
+
+    return result
 
 
 cdef apply_skip_features(OGRLayerH ogr_layer, int skip_features):
@@ -1630,7 +1935,9 @@ def ogr_read(
     int max_features=0,
     object where=None,
     tuple bbox=None,
+    object bbox_crs=None,
     object mask=None,
+    object mask_crs=None,
     object fids=None,
     str sql=None,
     str sql_dialect=None,
@@ -1681,6 +1988,18 @@ def ogr_read(
 
     if bbox and mask:
         raise ValueError("cannot set both 'bbox' and 'mask'")
+
+    if bbox_crs is not None and bbox is None:
+        raise ValueError("'bbox_crs' can only be used in combination with 'bbox'")
+
+    if mask_crs is not None and mask is None:
+        raise ValueError("'mask_crs' can only be used in combination with 'mask'")
+
+    if bbox_crs is not None and not isinstance(bbox_crs, str):
+        raise ValueError(f"Invalid bbox_crs: {bbox_crs!r}; expected a CRS string")
+
+    if mask_crs is not None and not isinstance(mask_crs, str):
+        raise ValueError(f"Invalid mask_crs: {mask_crs!r}; expected a CRS string")
 
     if skip_features < 0:
         raise ValueError("'skip_features' must be >= 0")
@@ -1787,10 +2106,10 @@ def ogr_read(
 
             # Apply the spatial filter
             if bbox is not None:
-                apply_bbox_filter(ogr_layer, bbox)
+                apply_bbox_filter(ogr_layer, bbox, bbox_crs)
 
             elif mask is not None:
-                apply_geometry_filter(ogr_layer, mask)
+                apply_geometry_filter(ogr_layer, mask, mask_crs)
 
             # Limit feature range to available range, but avoid doing an actual count if
             # not needed (with num_features=-1, we will read in chunks in get_features)
@@ -1918,7 +2237,9 @@ def ogr_open_arrow(
     int max_features=0,
     object where=None,
     tuple bbox=None,
+    object bbox_crs=None,
     object mask=None,
+    object mask_crs=None,
     object fids=None,
     str sql=None,
     str sql_dialect=None,
@@ -1988,6 +2309,18 @@ def ogr_open_arrow(
 
     if bbox and mask:
         raise ValueError("cannot set both 'bbox' and 'mask'")
+
+    if bbox_crs is not None and bbox is None:
+        raise ValueError("'bbox_crs' can only be used in combination with 'bbox'")
+
+    if mask_crs is not None and mask is None:
+        raise ValueError("'mask_crs' can only be used in combination with 'mask'")
+
+    if bbox_crs is not None and not isinstance(bbox_crs, str):
+        raise ValueError(f"Invalid bbox_crs: {bbox_crs!r}; expected a CRS string")
+
+    if mask_crs is not None and not isinstance(mask_crs, str):
+        raise ValueError(f"Invalid mask_crs: {mask_crs!r}; expected a CRS string")
 
     reader = None
     try:
@@ -2110,10 +2443,10 @@ def ogr_open_arrow(
 
         # Apply the spatial filter
         if bbox is not None:
-            apply_bbox_filter(ogr_layer, bbox)
+            apply_bbox_filter(ogr_layer, bbox, bbox_crs)
 
         elif mask is not None:
-            apply_geometry_filter(ogr_layer, mask)
+            apply_geometry_filter(ogr_layer, mask, mask_crs)
 
         # Limit feature range to available range (cannot use logic of
         # `validate_feature_range` because max_features is not supported)
@@ -2249,7 +2582,9 @@ def ogr_read_bounds(
     int max_features=0,
     object where=None,
     tuple bbox=None,
+    object bbox_crs=None,
     object mask=None,
+    object mask_crs=None,
 ):
     """Read bounds of features in the dataset."""
     cdef bint use_tmp_vsimem = isinstance(path_or_buffer, bytes)
@@ -2258,6 +2593,18 @@ def ogr_read_bounds(
 
     if bbox and mask:
         raise ValueError("cannot set both 'bbox' and 'mask'")
+
+    if bbox_crs is not None and bbox is None:
+        raise ValueError("'bbox_crs' can only be used in combination with 'bbox'")
+
+    if mask_crs is not None and mask is None:
+        raise ValueError("'mask_crs' can only be used in combination with 'mask'")
+
+    if bbox_crs is not None and not isinstance(bbox_crs, str):
+        raise ValueError(f"Invalid bbox_crs: {bbox_crs!r}; expected a CRS string")
+
+    if mask_crs is not None and not isinstance(mask_crs, str):
+        raise ValueError(f"Invalid mask_crs: {mask_crs!r}; expected a CRS string")
 
     if skip_features < 0:
         raise ValueError("'skip_features' must be >= 0")
@@ -2282,10 +2629,10 @@ def ogr_read_bounds(
 
         # Apply the spatial filter
         if bbox is not None:
-            apply_bbox_filter(ogr_layer, bbox)
+            apply_bbox_filter(ogr_layer, bbox, bbox_crs)
 
         elif mask is not None:
-            apply_geometry_filter(ogr_layer, mask)
+            apply_geometry_filter(ogr_layer, mask, mask_crs)
 
         # Limit feature range to available range
         skip_features, num_features = validate_feature_range(
